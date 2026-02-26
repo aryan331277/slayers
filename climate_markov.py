@@ -306,3 +306,105 @@ plt.savefig('plot_04_state_distribution.png', dpi=150, bbox_inches='tight', face
 plt.show()
 print('Saved: plot_04_state_distribution.png')
 
+shock_cols = ['shocks_drought_count', 'shocks_flood_count', 
+              'shocks_heatwave_count', 'shocks_wildfire_count', 'shocks_storm_count']
+shock_labels = ['Drought', 'Flood', 'Heatwave', 'Wildfire', 'Storm']
+
+shock_totals = targets.groupby('iso3')[shock_cols].sum().loc[nation_order]
+shock_totals.columns = shock_labels
+
+cmap_shock = LinearSegmentedColormap.from_list(
+    'shocks', ['#161b22', '#1a2744', '#1f6feb', '#58a6ff', '#cae8ff'], N=256
+)
+
+fig, ax = plt.subplots(figsize=(11, 6.5), facecolor='#0d1117')
+fig.suptitle('Total Shock Events per Nation  ·  EM-DAT Records 2000–2018',
+             fontsize=13, color='#e6edf3', fontweight='bold')
+
+im = ax.imshow(shock_totals.values, cmap=cmap_shock, aspect='auto')
+
+for r in range(len(nation_order)):
+    for c in range(len(shock_labels)):
+        val = shock_totals.values[r][c]
+        text_color = '#0d1117' if val > shock_totals.values.max() * 0.6 else '#e6edf3'
+        ax.text(c, r, str(int(val)), ha='center', va='center',
+                fontsize=11, fontweight='bold', color=text_color)
+
+ax.set_xticks(range(len(shock_labels)))
+ax.set_xticklabels(shock_labels, fontsize=10.5)
+ax.set_yticks(range(len(nation_order)))
+ax.set_yticklabels([f'{iso}  {nation_labels[iso]}' for iso in nation_order], fontsize=9.5)
+ax.spines[:].set_color('#30363d')
+
+cbar = fig.colorbar(im, ax=ax, shrink=0.8)
+cbar.set_label('Total events (19 yrs)', color='#8b949e', fontsize=9)
+cbar.ax.yaxis.set_tick_params(color='#8b949e')
+plt.setp(cbar.ax.yaxis.get_ticklabels(), color='#8b949e')
+cbar.outline.set_edgecolor('#30363d')
+
+plt.tight_layout()
+plt.savefig('plot_05_shock_heatmap.png', dpi=150, bbox_inches='tight', facecolor='#0d1117')
+plt.show()
+print('Saved: plot_05_shock_heatmap.png')
+
+
+def simulate_markov(matrix, n_steps=1000, start_state=0):
+    """Simulate n_steps of Markov chain, return state counts."""
+    current = start_state
+    counts = np.zeros(4)
+    for _ in range(n_steps):
+        probs = matrix[current]
+        if probs.sum() == 0:
+            probs = np.ones(4) / 4  # fallback uniform if row is zero
+        current = np.random.choice(4, p=probs)
+        counts[current] += 1
+    return counts / counts.sum()
+
+np.random.seed(42)
+
+fig, axes = plt.subplots(2, 5, figsize=(18, 7), facecolor='#0d1117')
+fig.suptitle('Validation: Simulated (1000yr) vs Empirical (19yr) State Distribution',
+             fontsize=12, color='#e6edf3', y=1.01, fontweight='bold')
+
+for idx, iso in enumerate(nation_order):
+    ax = axes[idx // 5][idx % 5]
+    
+    # Empirical
+    sub = targets[targets['iso3'] == iso]
+    empirical = np.zeros(4)
+    for s in STATES:
+        empirical[STATE_IDX[s]] = (sub['climate_state'] == s).sum()
+    empirical = empirical / empirical.sum()
+    
+    # Simulated
+    simulated = simulate_markov(climate_matrices[iso])
+    
+    x = np.arange(4)
+    w = 0.35
+    
+    bars_emp = ax.bar(x - w/2, empirical, w, label='Empirical', 
+                      color=[STATE_COLORS[s] for s in STATES], alpha=0.9, linewidth=0)
+    bars_sim = ax.bar(x + w/2, simulated, w, label='Simulated',
+                      color=[STATE_COLORS[s] for s in STATES], alpha=0.4, 
+                      hatch='///', linewidth=0)
+    
+    ax.set_xticks(x)
+    ax.set_xticklabels(['NOR', 'DRO', 'FLO', 'HTS'], fontsize=7.5)
+    ax.set_title(f'{iso}  {nation_labels[iso]}', fontsize=8.5, 
+                 color='#e6edf3', fontweight='bold')
+    ax.set_ylim(0, 1.1)
+    ax.set_ylabel('Proportion', fontsize=7.5, color='#6e7681')
+    ax.grid(axis='y', alpha=0.3)
+    ax.set_facecolor('#161b22')
+    ax.spines[:].set_color('#30363d')
+    
+    if idx == 0:
+        ax.legend(fontsize=7, loc='upper right', framealpha=0.7, edgecolor='#30363d')
+
+plt.tight_layout()
+plt.savefig('plot_06_validation.png', dpi=150, bbox_inches='tight', facecolor='#0d1117')
+plt.show()
+print('Saved: plot_06_validation.png')
+
+
+

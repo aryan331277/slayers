@@ -262,3 +262,47 @@ plt.show()
 print('Saved: plot_03_persistence_bars.png')
 
 
+fig, ax = plt.subplots(figsize=(14, 5.5), facecolor='#0d1117')
+fig.suptitle('Climate State Distribution per Nation  ·  19 years (2000–2018)',
+             fontsize=13, color='#e6edf3', fontweight='bold')
+
+state_counts = targets.groupby(['iso3', 'climate_state']).size().unstack(fill_value=0)
+# Reorder columns
+for s in STATES:
+    if s not in state_counts.columns:
+        state_counts[s] = 0
+state_counts = state_counts[STATES]
+state_counts = state_counts.loc[nation_order]
+
+# Convert to percentage
+state_pct = state_counts.div(state_counts.sum(axis=1), axis=0) * 100
+
+x = np.arange(len(nation_order))
+bottom = np.zeros(len(nation_order))
+
+for state in STATES:
+    vals = state_pct[state].values
+    bars = ax.bar(x, vals, bottom=bottom, color=STATE_COLORS[state], 
+                  label=state, width=0.6, linewidth=0)
+    
+    # Label if > 10%
+    for xi, (v, b) in enumerate(zip(vals, bottom)):
+        if v > 10:
+            ax.text(xi, b + v/2, f'{v:.0f}%', ha='center', va='center',
+                    fontsize=8, color='#0d1117', fontweight='bold')
+    bottom += vals
+
+ax.set_xticks(x)
+ax.set_xticklabels([f'{iso}\n{nation_labels[iso]}' for iso in nation_order], 
+                   fontsize=8.5)
+ax.set_ylabel('% of years in state', fontsize=10, color='#8b949e')
+ax.set_ylim(0, 105)
+ax.legend(loc='upper right', framealpha=0.8, edgecolor='#30363d', fontsize=9)
+ax.spines[:].set_color('#30363d')
+ax.grid(axis='y', alpha=0.3)
+
+plt.tight_layout()
+plt.savefig('plot_04_state_distribution.png', dpi=150, bbox_inches='tight', facecolor='#0d1117')
+plt.show()
+print('Saved: plot_04_state_distribution.png')
+

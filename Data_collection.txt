@@ -1,0 +1,116 @@
+WATER DATA
+
+FAO AQUASTAT — https://www.fao.org/aquastat/en/databases/maindatabase/
+
+Contains 180+ variables including water withdrawal, wastewater, pressure on water resources, irrigation and drainage for 200+ countries from 1960 to present arXiv
+Download up to 100,000 data points free; updated annually via questionnaire Springer
+Exact variables to pull: Total Renewable Water Resources (m³/capita), Agricultural Water Withdrawal (%), SDG 6.4.2 Water Stress Level
+Download path: Database → Country Statistics → Select (World) → Select variables → Share/Download → Excel
+Use these as your starting water_stock and water_stress_threshold per region
+
+
+
+World Resources Institute Aqueduct — https://www.wri.org/aqueduct
+
+Country-level water risk scores (Physical Quantity Risk, Quality Risk, Regulatory Risk) as GeoJSON and CSV
+Use the baseline water stress field directly as your depletion rate modifier
+
+
+FOOD / AGRICULTURE DATA
+
+FAOSTAT — https://www.fao.org/faostat/en/#data
+
+Food production quantity by country (tonnes), Food supply (kcal/capita/day), Crop yield, Land use
+API: https://fenixservices.fao.org/faostat/api/v1/en/data/QCL?area=5&item=2511&element=5312&year=2020&format=csv
+Pull: Cereal Yield (kg/hectare), Food Supply (kcal/capita/day), Agricultural Land (1000 ha)
+These seed your food_production_rate and arable_land values per region
+
+
+
+Our World in Data — Food — https://github.com/owid/owid-datasets
+
+Clean CSV, already normalized. Direct GitHub download. Use dietary-compositions-by-commodity-group.csv and food-supply-kcal.csv
+
+
+ENERGY DATA
+
+Our World in Data Energy — https://github.com/owid/energy-data
+
+CSV/XLSX format, 1 row per country per year. Covers primary energy consumption, renewable share, fossil fuel production; built from Energy Institute Statistical Review + EIA data Al Jazeera
+Key columns: primary_energy_consumption (TWh), renewables_share_energy (%), fossil_fuel_consumption (TWh), energy_per_capita
+Direct download: https://github.com/owid/energy-data/raw/master/owid-energy-data.csv
+Use renewables_share_energy as your region's energy resilience coefficient — regions with high renewables are less vulnerable to fossil shocks
+
+
+
+IEA World Energy Balances — https://www.iea.org/data-and-statistics (partial free tier)
+
+World Bank API — Energy indicators (free, no auth required)
+
+https://api.worldbank.org/v2/countries/all/indicators/EG.USE.PCAP.KG.OE?format=json&per_page=300&mrv=1
+Returns energy use per capita (kg of oil equivalent) for all countries, most recent year
+Also pull EG.ELC.ACCS.ZS (access to electricity %) for population vulnerability modeling
+
+
+CONFLICT & GEOPOLITICAL DATA
+
+UCDP (Uppsala Conflict Data Program) — https://ucdp.uu.se/downloads/
+
+Free CSV download of every armed conflict since 1946, tagged with resource types involved
+ucdp-prio-acd-221.csv — use incompatibility field and territory field to identify resource-linked conflicts
+This is your ground truth for validating emergent war behaviors: if your sim produces conflict between water-scarce neighbors, check if UCDP has a real analog
+
+
+
+ACLED (Armed Conflict Location & Event Data) — https://acleddata.com/data-export-tool/
+
+Free after registration. Country-level conflict events with coordinates and resource context
+Use to validate your conflict probability model: does water stress actually predict conflict onset?
+
+
+
+ND-GAIN Country Index — https://gain.nd.edu/our-work/country-index/download-data/
+
+Vulnerability + Readiness scores per country from 1995-present
+Directly usable as your region's adaptive capacity stat: how fast does a region recover from climate shock?
+
+
+CLIMATE SHOCK DATA
+
+NOAA Climate Data Online — https://www.ncdc.noaa.gov/cdo-web/
+
+Historical drought indices (Palmer Drought Severity Index), flood events by country
+Use to calibrate your Markov chain transition probabilities: actual historical drought/flood frequency per region
+
+
+
+EM-DAT International Disaster Database — https://www.emdat.be/
+
+Every natural disaster since 1900 with economic damage and deaths
+Download public_emdat_custom_request_*.xlsx — filter by Drought, Flood, Extreme temperature
+Use this to set your shock magnitude distributions per region — Sahel droughts reduce crop yield by mean 34%, not a random number you invented
+
+
+
+IPCC AR6 Regional Fact Sheets — https://www.ipcc.ch/report/ar6/wg1/
+
+Regional climate projections: temperature increase, precipitation change, drought frequency by 2050 under SSP2 and SSP5 scenarios
+Use SSP2 transition probabilities for your "moderate" scenario and SSP5 for your "stress test"
+
+
+TRADE & ECONOMIC DATA
+
+UN COMTRADE — https://comtradeplus.un.org/
+
+Actual bilateral trade flows for food, water-intensive goods, energy by country pair
+Use to initialize your trade graph: real trade relationships as starting edges, real flow volumes as edge weights
+API: https://comtradeapi.un.org/data/v1/get/C/A/HS?reporterCode=356&cmdCode=1001&flowCode=X
+
+
+
+World Bank WDI API (no key needed)
+
+https://api.worldbank.org/v2/countries/all/indicators/SP.POP.TOTL?format=json&mrv=1 — population
+https://api.worldbank.org/v2/countries/all/indicators/AG.LND.ARBL.ZS?format=json&mrv=1 — arable land (% of land area)
+https://api.worldbank.org/v2/countries/all/indicators/SL.AGR.EMPL.ZS?format=json&mrv=1 — employment in agriculture (% of total)
+These three together tell you how food-dependent a region's economy is → how hard food shocks hit

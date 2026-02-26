@@ -1,1874 +1,1377 @@
 """
-WorldSim India — PettingZoo AEC Environment
-=============================================
-10 Indian states govern themselves as AI agents competing for water, food,
-energy, and land resources under climate shocks and geopolitical pressure.
+WorldSim India — MAPPO Training
+=================================
+Multi-Agent Proximal Policy Optimization (MAPPO) implemented from scratch
+in pure PyTorch/NumPy — no RLlib dependency required.
 
-All parameters are derived from worldsim_merged.csv — nothing is hardcoded.
+Architecture:
+  • Centralised critic   (sees all agents' observations concatenated)
+  • Decentralised actors (each agent sees only its own 74-dim observation)
+  • Shared actor weights (parameter sharing across all 10 state-agents)
+  • GAE-Lambda advantage estimation
+  • PPO clipped surrogate objective with entropy bonus
+  • Separate Adam optimisers for actor and critic
 
-Columns used (43 total):
-  state, year
-  total_crop_area_ha, total_crop_production_t, n_crop_types   → food / land
-  energy_aggregate_fuel, energy_fuel                          → energy
-  rain_sub_annual, rain_sub_jun-sep, rain_sub_oct-dec,        → water / climate
-  rain_sub_jan-feb, rain_sub_mar-may, rain_sub_*monthly       → climate detail
-  rain_dist_annual, rain_dist_*monthly                        → water cross-check
-  population_thousands                                        → demand
-  per_capita_income_inr                                       → wealth / adaptive capacity
+Design references:
+  Yu et al. (2022) "The Surprising Effectiveness of PPO in Cooperative,
+    Multi-Agent Games" (MAPPO paper) — arXiv:2103.01955
+  Schulman et al. (2017) "Proximal Policy Optimization" — arXiv:1707.06347
+  Schulman et al. (2015) "High-Dimensional Continuous Control Using
+    Generalized Advantage Estimation" — arXiv:1506.02438
 
-Install (run once on Kaggle):
-  pip install pettingzoo gymnasium networkx scikit-learn matplotlib seaborn
+Usage (Kaggle):
+  # install once
+  !pip install pettingzoo gymnasium networkx scikit-learn torch -q
 
-Reference:
-  Terry et al. (2021)  "PettingZoo: Gym for Multi-Agent Reinforcement Learning"
-  Hoff (2011)          "Understanding the Nexus", Stockholm Environment Institute
-  Wilks (2011)         "Statistical Methods in Atmospheric Sciences"
+  # then run
+  python worldsim_mappo.py
+  # or import and call
+  from worldsim_mappo import MAPPOTrainer
+  trainer = MAPPOTrainer("worldsim_merged.csv")
+  trainer.train(n_episodes=500)
 """
 
 # ── Dependency check ──────────────────────────────────────────────────────────
 import subprocess, sys
-for pkg in ["pettingzoo", "gymnasium", "networkx"]:
+for pkg in ["torch", "pettingzoo", "gymnasium", "networkx"]:
     try:
         __import__(pkg)
     except ImportError:
         subprocess.check_call([sys.executable, "-m", "pip", "install", pkg, "-q"])
 
-import warnings, copy
-from collections import defaultdict
-from typing import Dict, List, Optional
+import os, time, copy, warnings
+from collections import defaultdict, deque
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
-import networkx as nx
-from sklearn.linear_model import LinearRegression
-from sklearn.preprocessing import MinMaxScaler
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.distributions import Categorical
+from torch.optim import Adam
 
-from pettingzoo import AECEnv
-from pettingzoo.utils import wrappers
-from pettingzoo.utils.agent_selector import agent_selector
-import gymnasium
-from gymnasium import spaces
+# Import our environment
+# from worldsim_india import (
+#     WorldSimIndiaEnv, AGENT_IDS, STATE_AGENTS,
+#     N_ACTIONS, CLIMATE_STATES,
+# )
 
 warnings.filterwarnings("ignore")
 
-# ══════════════════════════════════════════════════════════════════════════════
-# SECTION 1 — CONSTANTS
-# ══════════════════════════════════════════════════════════════════════════════
+# ── Reproducibility ───────────────────────────────────────────────────────────
+SEED = 42
+torch.manual_seed(SEED)
+np.random.seed(SEED)
 
-# 10 representative states — chosen for maximum diversity in resource profiles
-# RJ: water-scarce arid | MH: industrial large economy | UP: highest population
-# KL: highest rainfall   | GJ: semi-arid industrial    | WB: delta high rainfall
-# PB: breadbasket GW-stressed | BR: dense-poor agri   | KA: mixed tech-agri
-# TN: semi-arid industrial coast
-STATE_AGENTS: Dict[str, str] = {
-    "RJ": "Rajasthan",
-    "MH": "Maharashtra",
-    "UP": "Uttar Pradesh",
-    "KL": "Kerala",
-    "GJ": "Gujarat",
-    "WB": "West Bengal",
-    "PB": "Punjab",
-    "BR": "Bihar",
-    "KA": "Karnataka",
-    "TN": "Tamil Nadu",
-}
-
-# Agent IDs (short codes) used throughout the environment
-AGENT_IDS: List[str] = list(STATE_AGENTS.keys())
-
-# Climate states (Markov chain)
-CLIMATE_STATES = {0: "Normal", 1: "Drought", 2: "Flood", 3: "Heatwave", 4: "Storm"}
-
-# Action catalogue
-ACTION_TYPES: Dict[int, str] = {
-    0:  "invest_water",
-    1:  "invest_food",
-    2:  "invest_energy",
-    3:  "stockpile",
-    4:  "population_policy",
-    5:  "offer_water_trade",
-    6:  "offer_food_trade",
-    7:  "offer_energy_trade",
-    8:  "accept_trade",
-    9:  "reject_trade",
-    10: "defect_trade",
-    11: "form_alliance",
-    12: "leave_alliance",
-    13: "sanction",
-    14: "raid",
-    15: "diplomat",
-    16: "do_nothing",
-}
-N_ACTIONS = len(ACTION_TYPES)
-TARGETED_ACTIONS = {5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15}
+# ── Device ────────────────────────────────────────────────────────────────────
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"[MAPPO] Device: {DEVICE}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SECTION 2 — DATA LOADER
-# Reads worldsim_merged.csv and derives ALL simulation parameters from data
+# SECTION 1 — HYPERPARAMETERS
 # ══════════════════════════════════════════════════════════════════════════════
 
-class WorldSimDataLoader:
+@dataclass
+class MAPPOConfig:
+    """All training hyperparameters in one place."""
+
+    # ── Environment ────────────────────────────────────────────────────────
+    csv_path:          str   = "worldsim_merged.csv"
+    max_cycles:        int   = 150      # steps per episode
+    noise_level:       float = 0.30     # observation noise (partial observability)
+    reward_clip:       float = 5.0      # Clip rewards to [-clip, clip] for stability
+
+    # ── Training schedule ──────────────────────────────────────────────────
+    n_episodes:        int   = 600      # total training episodes
+    n_epochs:          int   = 4        # PPO update epochs per episode (reduced from 8 for stability)
+    minibatch_size:    int   = 128      # minibatch size for PPO update (increased from 64)
+    eval_every:        int   = 50       # evaluate every N episodes (no exploration)
+    save_every:        int   = 100      # save checkpoint every N episodes
+    checkpoint_dir:    str   = "checkpoints"
+
+    # ── Network architecture ───────────────────────────────────────────────
+    obs_dim:           int   = 74       # must match WorldSimIndiaEnv.OBS_DIM
+    n_agents:          int   = 10
+    n_actions:         int   = N_ACTIONS   # 17
+    n_targets:         int   = 10          # one per agent (target selection)
+    actor_hidden:      List  = field(default_factory=lambda: [256, 256])
+    critic_hidden:     List  = field(default_factory=lambda: [512, 512])
+
+    # ── PPO ────────────────────────────────────────────────────────────────
+    gamma:             float = 0.995     # discount factor (increased from 0.99 for longer horizon)
+    gae_lambda:        float = 0.95     # GAE-λ
+    clip_eps:          float = 0.15     # PPO clip ε (reduced from 0.20 for more conservative updates)
+    entropy_coeff:     float = 0.02     # entropy bonus coefficient (slightly increased)
+    value_coeff:       float = 1.0      # value loss coefficient (increased from 0.50)
+    max_grad_norm:     float = 0.5      # gradient clipping (tightened from 10.0)
+    target_kl:         float = 0.01     # Target KL divergence for early stopping
+
+    # ── Optimiser ──────────────────────────────────────────────────────────
+    lr_actor:          float = 5e-5     # Further reduced
+    lr_critic:         float = 1e-4     # Further reduced
+    lr_decay:          float = 0.999    # Slower decay
+
+    # ── Exploration ────────────────────────────────────────────────────────
+    # Linear decay of entropy coefficient:  end_entropy after warmup_episodes
+    entropy_start:     float = 0.1      # Increased from 0.05
+    entropy_end:       float = 0.01     # Increased from 0.005
+    entropy_decay_eps: int   = 400
+
+    # ── Normalisation ──────────────────────────────────────────────────────
+    normalise_obs:     bool  = True     # running mean/std normalisation
+    normalise_returns: bool  = True     # return normalisation
+    normalise_rewards: bool  = True     # NEW: reward normalisation
+
+    # ── Curriculum learning ────────────────────────────────────────────────
+    # Start with cooperative reward (team avg), gradually shift to individual
+    curriculum_start:  float = 0.70    # weight on team reward at episode 0
+    curriculum_end:    float = 0.20    # weight on team reward at final episode
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 2 — NEURAL NETWORK ARCHITECTURES
+# ══════════════════════════════════════════════════════════════════════════════
+
+class RunningNorm(nn.Module):
     """
-    Derives all simulation parameters from worldsim_merged.csv.
-
-    Column → Simulation Variable mapping
-    ─────────────────────────────────────
-    rain_sub_annual / rain_dist_annual    → water availability stock
-    rain_sub_jun-sep                      → monsoon reliability (Drought/Flood risk)
-    rain_sub_oct-dec                      → cyclone/post-monsoon risk (Storm risk)
-    rain_sub_mar-may                      → pre-monsoon heat risk (Heatwave risk)
-    total_crop_production_t               → food production capacity
-    total_crop_area_ha                    → land resource
-    n_crop_types                          → agricultural diversity (resilience)
-    energy_aggregate_fuel + energy_fuel   → total energy capacity (MW)
-    population_thousands                  → demand multiplier / carrying capacity
-    per_capita_income_inr                 → economic power / adaptive capacity
+    Online running mean/std normalisation (Welford algorithm).
+    Applied to observations before they enter the networks.
+    Critical for stability in PPO when inputs have very different scales.
     """
-
-    BASE_YEAR = 2015  # Midpoint with broadest data coverage
-
-    def __init__(self, csv_path: str):
-        print(f"[DataLoader] Loading {csv_path} ...")
-        raw = pd.read_csv(csv_path)
-
-        # ── Deduplicate: multiple per_capita_income rows per state/year ───────
-        # Exclude 'year' from the aggregated numeric cols to avoid reset_index collision.
-        num_cols = [c for c in raw.select_dtypes(include=np.number).columns
-                    if c != "year"]
-        self.df = (
-            raw.groupby(["state", "year"])[num_cols]
-            .mean()
-            .reset_index()
-        )
-        print(f"[DataLoader] Deduplicated: {raw.shape} → {self.df.shape}")
-
-        # Filter to our 10 target states
-        target_names = list(STATE_AGENTS.values())
-        self.df_targets = self.df[self.df["state"].isin(target_names)].copy()
-
-        # Build inverse map: full state name → agent ID
-        self._name_to_id = {v: k for k, v in STATE_AGENTS.items()}
-
-        # Compute cross-state normalisation ranges (use all target rows)
-        self._ranges: Dict[str, Dict] = self._compute_ranges()
-
-        # Main outputs consumed by the environment
-        self.region_init       = self._compute_region_init()
-        self.depletion_rates   = self._compute_depletion_rates()
-        self.climate_matrices  = self._compute_climate_matrices()
-        self.trade_graph       = self._compute_trade_graph()
-
-        self._print_init_summary()
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # Helpers
-    # ─────────────────────────────────────────────────────────────────────────
-
-    def _get(self, state_name: str, col: str, year: int) -> float:
-        """Return value at specific year; interpolate from nearest if missing."""
-        sub = (
-            self.df_targets[self.df_targets["state"] == state_name]
-            .sort_values("year")
-        )
-        exact = sub[sub["year"] == year][col].dropna()
-        if len(exact) > 0:
-            return float(exact.iloc[0])
-        valid = sub[col].dropna()
-        if len(valid) == 0:
-            return np.nan
-        return float(np.interp(year, sub.loc[valid.index, "year"].values, valid.values))
-
-    def _get_series(self, state_name: str, col: str) -> pd.Series:
-        """Return full time-series for a state+column, sorted by year."""
-        sub = (
-            self.df_targets[self.df_targets["state"] == state_name]
-            .sort_values("year")[["year", col]]
-            .dropna()
-        )
-        return sub
-
-    def _safe(self, v: float, fallback: float) -> float:
-        return fallback if (np.isnan(v) or np.isinf(v)) else float(v)
-
-    def _compute_ranges(self) -> Dict[str, Dict]:
-        """Cross-state min/max for normalisation, computed over BASE_YEAR ± 5."""
-        year_window = range(self.BASE_YEAR - 5, self.BASE_YEAR + 6)
-        sub = self.df_targets[self.df_targets["year"].isin(year_window)].copy()
-        ranges: Dict[str, Dict] = {}
-
-        # Raw column ranges
-        for col in sub.select_dtypes(include=np.number).columns:
-            if col == "year":
-                continue
-            vals = sub[col].dropna().values
-            if len(vals) == 0:
-                ranges[col] = {"min": 0.0, "max": 1.0}
-            else:
-                ranges[col] = {"min": float(vals.min()), "max": float(vals.max())}
-
-        # ── Derived per-capita ranges (important: normalise against like-for-like) ──
-        pop_k = sub["population_thousands"].replace(0, np.nan)
-
-        # Food per capita (tonnes/person)
-        sub["_food_pc"] = sub["total_crop_production_t"] / (pop_k * 1000)
-        # Energy per capita (MW per 1000 people)
-        sub["_energy_pc"] = (sub["energy_aggregate_fuel"].fillna(0)
-                             + sub["energy_fuel"].fillna(0)) / pop_k
-        # Land per capita (ha/person)
-        sub["_land_pc"] = sub["total_crop_area_ha"] / (pop_k * 1000)
-        # Rainfall (use dist_annual as the range reference)
-        # rain_dist_annual already in ranges — used as proxy for rain_combined too
-
-        for derived in ("_food_pc", "_energy_pc", "_land_pc"):
-            vals = sub[derived].replace([np.inf, -np.inf], np.nan).dropna().values
-            if len(vals) == 0:
-                ranges[derived] = {"min": 0.0, "max": 1.0}
-            else:
-                ranges[derived] = {"min": float(vals.min()), "max": float(vals.max())}
-
-        return ranges
-
-    def _norm(self, value: float, col: str, invert: bool = False) -> float:
-        """Normalise value to [0.05, 1.0]; optionally invert (1 - norm)."""
-        if np.isnan(value) or col not in self._ranges:
-            return 0.5
-        mn, mx = self._ranges[col]["min"], self._ranges[col]["max"]
-        if mx == mn:
-            return 0.5
-        n = np.clip((value - mn) / (mx - mn), 0.0, 1.0)
-        n = 0.05 + n * 0.95  # map to [0.05, 1.0] — avoid absolute zero
-        return float(1.0 - n) if invert else float(n)
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # Region initialisation
-    # ─────────────────────────────────────────────────────────────────────────
-
-    def _compute_region_init(self) -> Dict[str, Dict]:
-        """
-        Build initial state vector for each agent from worldsim_merged.csv.
-
-        Column → Variable derivation (verbose):
-
-        WATER STOCK:
-          Primary:  rain_dist_annual   [mm] — long-run average district rainfall.
-          Secondary: rain_sub_annual   [mm] — subdivision historical mean.
-          Combined via weighted average. Higher rainfall → higher water stock.
-          Water-stressed states (RJ: ~300mm, PB heavy GW withdrawal) score lower.
-
-        FOOD STOCK:
-          total_crop_production_t / (population_thousands × 1000) = tonnes/person
-          Normalised across states. Also scaled by n_crop_types diversity bonus.
-          High production per capita AND diverse crops = high food security.
-
-        ENERGY STOCK:
-          energy_aggregate_fuel + energy_fuel = total installed capacity [MW]
-          Divided by population_thousands to get MW per 1000 persons.
-          Higher per-capita capacity = higher energy stock.
-
-        LAND STOCK:
-          total_crop_area_ha / (population_thousands × 1000) = ha/person
-          Higher cultivated area per person = greater land resource.
-          Also modulated by rain_dist_annual (irrigated potential).
-
-        ECONOMIC POWER:
-          per_capita_income_inr normalised. High PCI = high economic power.
-
-        ADAPTIVE CAPACITY:
-          0.4 × economic_power + 0.3 × energy_stock + 0.3 × crop_diversity
-          Wealthier, more energy-secure, more diverse states adapt better.
-
-        SOCIAL STABILITY:
-          Inverse of per_capita_income_inr CV (within state, across years) +
-          inverse of population growth pressure.
-          More stable income = more stable society.
-
-        MILITARY STRENGTH (geopolitical influence):
-          Proxy: 0.5 × economic_power + 0.3 × population_norm + 0.2 × energy_stock
-          Large, wealthy, industrialised states have more political leverage.
-
-        TRADE OPENNESS:
-          food surplus ratio = production - estimated consumption (pop × calorie need)
-          Energy surplus: whether state is net producer above its own demand.
-          Surplus states are more open to trade.
-
-        FINANCIAL VULNERABILITY:
-          Inverse of PCI relative to median. Poor states = more financially fragile.
-          Also: negative PCI values (seen in data) = immediate vulnerability.
-
-        CLIMATE VULNERABILITY (per historical record):
-          Drought frequency: years where jun-sep rain < (mean - 1σ) / total years
-          Flood frequency:   years where jun-sep rain > (mean + 1σ) / total years
-          Heatwave proxy:    states with rain_sub_mar-may < 50mm AND annual < 600mm
-          Storm proxy:       states with rain_sub_oct-dec > 200mm (Bay of Bengal cyclones)
-          Shock severity:    max single-year deviation from mean rainfall
-        """
-        init: Dict[str, Dict] = {}
-        y = self.BASE_YEAR
-
-        for agent_id, state_name in STATE_AGENTS.items():
-            # ── Raw value extraction ─────────────────────────────────────────
-            rain_dist   = self._safe(self._get(state_name, "rain_dist_annual", y), np.nan)
-            rain_sub    = self._safe(self._get(state_name, "rain_sub_annual", y), np.nan)
-            rain_monsoon= self._safe(self._get(state_name, "rain_sub_jun-sep", y), np.nan)
-            rain_premonsoon = self._safe(self._get(state_name, "rain_sub_mar-may", y), np.nan)
-            rain_postmonsoon= self._safe(self._get(state_name, "rain_sub_oct-dec", y), np.nan)
-
-            crop_prod   = self._safe(self._get(state_name, "total_crop_production_t", y), np.nan)
-            crop_area   = self._safe(self._get(state_name, "total_crop_area_ha", y), np.nan)
-            n_crops     = self._safe(self._get(state_name, "n_crop_types", y), 20.0)
-            energy_agg  = self._safe(self._get(state_name, "energy_aggregate_fuel", y), np.nan)
-            energy_fuel = self._safe(self._get(state_name, "energy_fuel", y), np.nan)
-            pop_k       = self._safe(self._get(state_name, "population_thousands", y), 10000.0)
-            pci         = self._safe(self._get(state_name, "per_capita_income_inr", y), np.nan)
-
-            # Replace NaN with column median across all targets
-            def med(col: str) -> float:
-                v = self.df_targets[col].dropna()
-                return float(v.median()) if len(v) > 0 else 1.0
-
-            if np.isnan(rain_dist):    rain_dist    = self._safe(rain_sub, med("rain_dist_annual"))
-            if np.isnan(rain_sub):     rain_sub     = self._safe(rain_dist, med("rain_sub_annual"))
-            if np.isnan(rain_monsoon): rain_monsoon = rain_sub * 0.65  # monsoon ≈ 65% of annual
-            if np.isnan(rain_premonsoon): rain_premonsoon = rain_sub * 0.05
-            if np.isnan(rain_postmonsoon):rain_postmonsoon= rain_sub * 0.10
-            if np.isnan(crop_prod):    crop_prod    = med("total_crop_production_t")
-            if np.isnan(crop_area):    crop_area    = med("total_crop_area_ha")
-            if np.isnan(energy_agg):   energy_agg   = 0.0
-            if np.isnan(energy_fuel):  energy_fuel  = 0.0
-            if np.isnan(pci):          pci          = med("per_capita_income_inr")
-
-            pop_safe = max(pop_k, 1.0)
-            energy_total = energy_agg + energy_fuel
-
-            # ── WATER STOCK ──────────────────────────────────────────────────
-            # Best signal: district-level long-run annual rainfall (mm).
-            # We use average of dist and sub when both available.
-            rain_combined = (rain_dist + rain_sub) / 2.0
-            water_stock = self._norm(rain_combined, "rain_dist_annual")
-            # Groundwater pressure proxy: dry states with intensive agriculture
-            # Punjab: high crop area + low rainfall → GW depleted
-            agri_intensity = crop_area / (pop_safe * 1000)  # ha per person
-            gw_pressure = np.clip(agri_intensity / 0.5, 0, 1)  # >0.5 ha/person = stressed
-            water_stock = np.clip(water_stock - gw_pressure * 0.15, 0.05, 1.0)
-
-            # ── FOOD STOCK ───────────────────────────────────────────────────
-            prod_per_cap = crop_prod / (pop_safe * 1000)  # tonnes per person
-            crop_div_bonus = np.clip((n_crops - 5) / 70.0, 0, 0.2)  # 0→+0.2
-            food_stock = self._norm(prod_per_cap, "_food_pc") + crop_div_bonus
-            food_stock = np.clip(food_stock, 0.05, 1.0)
-
-            # ── ENERGY STOCK ─────────────────────────────────────────────────
-            energy_per_cap = energy_total / pop_safe  # MW per thousand people
-            energy_stock = self._norm(energy_per_cap, "_energy_pc")
-            energy_stock = np.clip(energy_stock, 0.05, 1.0)
-
-            # ── LAND STOCK ───────────────────────────────────────────────────
-            area_per_cap = crop_area / (pop_safe * 1000)  # ha per person
-            rain_boost = np.clip(rain_combined / 2000.0, 0, 0.2)  # rain improves land potential
-            land_stock = self._norm(area_per_cap, "_land_pc") + rain_boost
-            land_stock = np.clip(land_stock, 0.05, 1.0)
-
-            # ── POPULATION ───────────────────────────────────────────────────
-            pop_norm = self._norm(pop_k, "population_thousands")
-
-            # ── ECONOMIC POWER ───────────────────────────────────────────────
-            # Use absolute PCI. Cap at 0 for negative values (anomalous data).
-            pci_safe = max(pci, 0.0)
-            economic_power = self._norm(pci_safe, "per_capita_income_inr")
-
-            # ── ADAPTIVE CAPACITY ────────────────────────────────────────────
-            adaptive_capacity = (
-                0.40 * economic_power
-                + 0.30 * energy_stock
-                + 0.20 * food_stock
-                + 0.10 * np.clip((n_crops / 76.0), 0, 1)  # 76 = max n_crop_types in data
-            )
-            adaptive_capacity = np.clip(adaptive_capacity, 0.05, 1.0)
-
-            # ── SOCIAL STABILITY ─────────────────────────────────────────────
-            # Proxy: stability of PCI over years (CV = std/mean, lower = more stable)
-            pci_series = self._get_series(state_name, "per_capita_income_inr")["per_capita_income_inr"]
-            if len(pci_series) >= 3 and pci_series.mean() > 0:
-                cv = pci_series.std() / pci_series.mean()
-                stability_from_cv = float(1.0 - np.clip(cv, 0, 1))
-            else:
-                stability_from_cv = 0.5
-            # Also: poor states with high pop density = lower stability
-            social_stability = (
-                0.40 * stability_from_cv
-                + 0.40 * economic_power
-                + 0.20 * (1.0 - pop_norm)   # smaller population = easier to govern
-            )
-            social_stability = np.clip(social_stability, 0.05, 1.0)
-
-            # ── MILITARY / GEOPOLITICAL STRENGTH ─────────────────────────────
-            # Proxy: large + wealthy + industrial states have more influence.
-            military_str = (
-                0.50 * economic_power
-                + 0.30 * pop_norm
-                + 0.20 * energy_stock
-            )
-            military_str = np.clip(military_str, 0.05, 1.0)
-
-            # ── TRADE OPENNESS ────────────────────────────────────────────────
-            # Food surplus: production per cap above subsistence (assume 0.25 t/person/yr)
-            subsistence_tpc = 0.25
-            food_surplus = np.clip((prod_per_cap - subsistence_tpc) / subsistence_tpc, 0, 1)
-            # Energy surplus: above-median energy per cap → can export
-            median_energy_pc = med("energy_aggregate_fuel") / med("population_thousands")
-            energy_surplus = np.clip((energy_per_cap - median_energy_pc) / (median_energy_pc + 1), 0, 1)
-            trade_openness = np.clip(0.55 * food_surplus + 0.45 * energy_surplus, 0.05, 1.0)
-
-            # ── FINANCIAL VULNERABILITY ───────────────────────────────────────
-            median_pci = float(self.df_targets["per_capita_income_inr"].dropna().median())
-            if median_pci > 0:
-                # How far below median? More below = more vulnerable
-                gap = max(0.0, median_pci - pci_safe) / (median_pci + 1)
-            else:
-                gap = 0.5
-            fin_vulnerability = np.clip(gap, 0.0, 1.0)
-
-            # ── CLIMATE SHOCK HISTORY ─────────────────────────────────────────
-            monsoon_series = self._get_series(state_name, "rain_sub_jun-sep")["rain_sub_jun-sep"]
-            if len(monsoon_series) >= 5:
-                m_mean = float(monsoon_series.mean())
-                m_std  = float(monsoon_series.std())
-                m_std  = max(m_std, 1.0)
-                n_years = len(monsoon_series)
-                drought_freq = float((monsoon_series < m_mean - m_std).sum()) / n_years
-                flood_freq   = float((monsoon_series > m_mean + m_std).sum()) / n_years
-                # Max normalised single-year deviation = shock severity
-                deviations = np.abs(monsoon_series - m_mean) / (m_std + 1e-9)
-                shock_severity = float(np.clip(deviations.max() / 3.0, 0, 1))
-            else:
-                drought_freq  = 0.15
-                flood_freq    = 0.10
-                shock_severity= 0.20
-
-            # Heatwave proxy: pre-monsoon heat state (arid states = higher risk)
-            # If rain_sub_mar-may < 30mm AND annual < 600 → heatwave-prone
-            heatwave_freq = float(np.clip(
-                (1.0 - np.clip(rain_premonsoon / 100.0, 0, 1)) *
-                (1.0 - np.clip(rain_combined / 1000.0, 0, 1)),
-                0, 1
-            ))
-            # Storm proxy: post-monsoon heavy rain = cyclone exposure
-            storm_freq = float(np.clip(rain_postmonsoon / 500.0, 0, 1))
-
-            # ── WATER-FOOD COUPLING ───────────────────────────────────────────
-            # How much food production depends on water (irrigation-heavy = high coupling)
-            # Proxy: agri intensity relative to rainfall
-            # High area + low rain = heavy irrigation dependence
-            if rain_combined > 0:
-                coupling = np.clip(agri_intensity / (rain_combined / 500.0), 0, 1)
-            else:
-                coupling = 0.8
-            water_food_coupling = float(coupling)
-
-            # ── RAINFALL RECHARGE RATE ────────────────────────────────────────
-            rainfall_recharge = float(self._norm(rain_combined, "rain_dist_annual"))
-
-            init[agent_id] = {
-                # Core resource stocks [0-1]
-                "water_stock":          float(water_stock),
-                "food_stock":           float(food_stock),
-                "energy_stock":         float(energy_stock),
-                "land_stock":           float(land_stock),
-                # Capabilities [0-1]
-                "population_norm":      float(pop_norm),
-                "economic_power":       float(economic_power),
-                "military_strength":    float(military_str),
-                "adaptive_capacity":    float(adaptive_capacity),
-                "social_stability":     float(social_stability),
-                "trade_openness":       float(trade_openness),
-                "financial_vulnerability": float(fin_vulnerability),
-                # Resource dynamics
-                "water_food_coupling":  water_food_coupling,
-                "rainfall_recharge":    rainfall_recharge,
-                # Climate vulnerability
-                "drought_freq":         float(drought_freq),
-                "flood_freq":           float(flood_freq),
-                "heatwave_freq":        float(heatwave_freq),
-                "storm_freq":           float(storm_freq),
-                "shock_severity":       float(shock_severity),
-                # Raw values (for reference / depletion rate calcs)
-                "raw_population_k":     float(pop_k),
-                "raw_pci":              float(pci_safe),
-                "raw_rain_annual":      float(rain_combined),
-                "raw_energy_mw":        float(energy_total),
-                "raw_crop_prod_t":      float(crop_prod),
-                "raw_crop_area_ha":     float(crop_area),
-                "n_crop_types":         float(n_crops),
-                "fragility_score":      float(1.0 - social_stability),  # inverse
-                "state_name":           state_name,
-                "agent_id":             agent_id,
-            }
-
-        return init
-
-    # ─────────────────────────────────────────────────────────────────────────
-    def _compute_depletion_rates(self) -> Dict[str, Dict]:
-        """
-        Fit LinearRegression slope (per year) for each key column per state.
-        Returns fractional annual change relative to mean.
-        Used in world_step to apply realistic resource depletion/growth.
-        """
-        columns = {
-            # rain_sub_annual has real year-to-year variation; rain_dist_annual
-            # is a static long-run average and always has slope ≈ 0.
-            "water":   "rain_sub_annual",           # monsoon rainfall trend
-            "food":    "total_crop_production_t",   # production trend
-            "energy":  "energy_aggregate_fuel",     # installed capacity trend
-            "land":    "total_crop_area_ha",         # cultivated area trend
-            "pop":     "population_thousands",       # population trend
-            "pci":     "per_capita_income_inr",      # income trend
-        }
-        rates: Dict[str, Dict] = {}
-        for agent_id, state_name in STATE_AGENTS.items():
-            rates[agent_id] = {}
-            for name, col in columns.items():
-                series = self._get_series(state_name, col)
-                if len(series) < 4:
-                    rates[agent_id][name] = {"slope_frac": 0.0, "baseline": 0.0}
-                    continue
-                X = series["year"].values.reshape(-1, 1)
-                y = series[col].values
-                slope = float(LinearRegression().fit(X, y).coef_[0])
-                mean_val = float(y.mean())
-                rates[agent_id][name] = {
-                    "slope_raw":  slope,
-                    "slope_frac": slope / mean_val if abs(mean_val) > 1e-9 else 0.0,
-                    "baseline":   mean_val,
-                    "n_points":   len(series),
-                }
-        return rates
-
-    # ─────────────────────────────────────────────────────────────────────────
-    def _compute_climate_matrices(self) -> Dict[str, Dict]:
-        """
-        Build per-state 5×5 Markov transition matrices from historical rainfall.
-
-        Climate state classification (from rain_sub columns):
-          0 = Normal   : monsoon within ±0.5σ of mean
-          1 = Drought   : jun-sep  < mean − 1σ
-          2 = Flood     : jun-sep  > mean + 1σ
-          3 = Heatwave  : mar-may  < 30mm  AND annual < 700mm
-          4 = Storm     : oct-dec  > mean + 1σ  (Bay of Bengal cyclone proxy)
-
-        Laplace smoothing (+0.5) prevents zero-probability transitions.
-        Ref: Wilks (2011) Statistical Methods in Atmospheric Sciences, §4.
-        """
-        matrices: Dict[str, Dict] = {}
-
-        for agent_id, state_name in STATE_AGENTS.items():
-            sub = (
-                self.df_targets[self.df_targets["state"] == state_name]
-                .sort_values("year")
-                .reset_index(drop=True)
-            )
-
-            # Monsoon series for drought/flood classification
-            monsoon = sub["rain_sub_jun-sep"].fillna(
-                sub["rain_dist_jun"].fillna(0) + sub["rain_dist_jul"].fillna(0)
-                + sub["rain_dist_aug"].fillna(0) + sub["rain_dist_sep"].fillna(0)
-            )
-            premonsoon = sub["rain_sub_mar-may"].fillna(
-                sub["rain_dist_mar"].fillna(0) + sub["rain_dist_apr"].fillna(0)
-                + sub["rain_dist_may"].fillna(0)
-            )
-            postmonsoon = sub["rain_sub_oct-dec"].fillna(
-                sub["rain_dist_oct"].fillna(0) + sub["rain_dist_nov"].fillna(0)
-                + sub["rain_dist_dec"].fillna(0)
-            )
-            annual = sub["rain_dist_annual"].fillna(sub["rain_sub_annual"])
-
-            m_mean  = monsoon.mean()
-            m_std   = max(monsoon.std(), 1.0)
-            pm_mean = postmonsoon.mean()
-            pm_std  = max(postmonsoon.std(), 1.0)
-
-            def classify_year(i: int) -> int:
-                mon = monsoon.iloc[i]
-                premon = premonsoon.iloc[i]
-                postmon = postmonsoon.iloc[i]
-                ann = annual.iloc[i] if not pd.isna(annual.iloc[i]) else 1000.0
-                if mon < m_mean - m_std:
-                    return 1  # Drought
-                if mon > m_mean + m_std:
-                    return 2  # Flood
-                if postmon > pm_mean + pm_std:
-                    return 4  # Storm
-                if premon < 30.0 and ann < 700.0:
-                    return 3  # Heatwave
-                return 0       # Normal
-
-            states = [classify_year(i) for i in range(len(sub))]
-
-            # Transition matrix with Laplace smoothing
-            mat = np.ones((5, 5)) * 0.5
-            for i in range(len(states) - 1):
-                mat[states[i]][states[i + 1]] += 1
-            mat /= mat.sum(axis=1, keepdims=True)
-
-            state_counts = np.bincount(states, minlength=5).astype(float)
-            matrices[agent_id] = {
-                "matrix":     mat,
-                "state_dist": state_counts / max(state_counts.sum(), 1),
-                "last_state": states[-1] if states else 0,
-            }
-
-        return matrices
-
-    # ─────────────────────────────────────────────────────────────────────────
-    def _compute_trade_graph(self) -> nx.DiGraph:
-        """
-        Initial bilateral trade graph using gravity model.
-        Trade potential ∝ √(GDP_i × GDP_j) × (openness_i + openness_j)/2
-        GDP proxy = per_capita_income_inr × population_thousands
-
-        Edges added only above threshold (≥0.10 normalised score).
-        """
-        G = nx.DiGraph()
-        G.add_nodes_from(AGENT_IDS)
-
-        gdp_proxy  = {}
-        openness   = {}
-        for agent_id, state_name in STATE_AGENTS.items():
-            pci   = self._safe(self._get(state_name, "per_capita_income_inr", self.BASE_YEAR), 10000.0)
-            pop   = self._safe(self._get(state_name, "population_thousands", self.BASE_YEAR), 10000.0)
-            pci_safe = max(pci, 0.0)
-            gdp_proxy[agent_id]  = pci_safe * pop
-            openness[agent_id] = self.region_init[agent_id]["trade_openness"]
-
-        max_gdp = max(gdp_proxy.values()) if gdp_proxy else 1.0
-        scores  = []
-        for i, ai in enumerate(AGENT_IDS):
-            for j, aj in enumerate(AGENT_IDS):
-                if ai == aj:
-                    continue
-                gravity = (
-                    np.sqrt(gdp_proxy[ai] * gdp_proxy[aj]) / (max_gdp + 1e-9)
-                ) * (openness[ai] + openness[aj]) / 2.0
-                scores.append((ai, aj, gravity))
-
-        if scores:
-            max_s = max(s[2] for s in scores)
-            for ai, aj, s in scores:
-                w = s / (max_s + 1e-9)
-                if w > 0.10:
-                    G.add_edge(ai, aj, weight=w, resource_type="mixed",
-                               volume=w, age=0, active=True)
-        return G
-
-    # ─────────────────────────────────────────────────────────────────────────
-    def _print_init_summary(self):
-        print(f"\n[DataLoader] Initialisation summary:")
-        print(f"  {'ID':<4} {'State':<22} {'Water':>6} {'Food':>6} {'Energy':>7} "
-              f"{'Land':>6} {'EcoPow':>7} {'Adapt':>6} {'SocStab':>8}")
-        for aid in AGENT_IDS:
-            r = self.region_init[aid]
-            print(
-                f"  {aid:<4} {r['state_name']:<22} "
-                f"{r['water_stock']:>6.3f} {r['food_stock']:>6.3f} "
-                f"{r['energy_stock']:>7.3f} {r['land_stock']:>6.3f} "
-                f"{r['economic_power']:>7.3f} {r['adaptive_capacity']:>6.3f} "
-                f"{r['social_stability']:>8.3f}"
-            )
-        print(f"\n[DataLoader] Trade graph: {self.trade_graph.number_of_nodes()} nodes, "
-              f"{self.trade_graph.number_of_edges()} edges")
-        print(f"[DataLoader] Done.\n")
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# SECTION 3 — ENVIRONMENT FACTORY
-# ══════════════════════════════════════════════════════════════════════════════
-
-def env(csv_path: str, max_cycles: int = 200, noise_level: float = 0.3):
-    """Standard PettingZoo factory function."""
-    raw_env = WorldSimIndiaEnv(csv_path=csv_path, max_cycles=max_cycles,
-                               noise_level=noise_level)
-    raw_env = wrappers.AssertOutOfBoundsWrapper(raw_env)
-    raw_env = wrappers.OrderEnforcingWrapper(raw_env)
-    return raw_env
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# SECTION 4 — PETTINGZOO AEC ENVIRONMENT
-# ══════════════════════════════════════════════════════════════════════════════
-
-class WorldSimIndiaEnv(AECEnv):
-    """
-    WorldSim India — 10 Indian states as AI agents in a multi-agent resource
-    conflict simulation seeded entirely from real data.
-
-    Observation space : 74-dimensional float32 vector (see _observe docstring)
-    Action space      : MultiDiscrete([17, 10]) — action_type × target_agent
-    """
-
-    metadata = {
-        "render_modes": ["human"],
-        "name": "worldsim_india_v1",
-        "is_parallelizable": False,
-    }
-
-    # ── Water-Food-Energy Nexus thresholds (Hoff 2011, FAO AQUASTAT) ─────────
-    NEXUS_WATER_THRESHOLD  = 0.20   # water < 20% → food cascade
-    NEXUS_ENERGY_THRESHOLD = 0.15   # energy < 15% → water cascade
-    NEXUS_FOOD_MULTIPLIER  = 0.40   # food production multiplier when water critical
-    NEXUS_WATER_MULTIPLIER = 0.60   # water efficiency when energy critical
-    COLLAPSE_THRESHOLD     = 0.05   # below this = catastrophic collapse
-
-    # ── Conflict weights (Gleditsch et al. 2002 UCDP/PRIO) ───────────────────
-    CONFLICT_WATER_W    = 0.35
-    CONFLICT_FOOD_W     = 0.25
-    CONFLICT_FRAGILITY_W= 0.20
-    CONFLICT_HISTORY_W  = 0.20
-
-    # ── Population dynamics (Verhulst logistic) ───────────────────────────────
-    POP_GROWTH_RATE        = 0.018  # 1.8 % annual (India average 2000-2020)
-
-    # Observation dimension
-    OBS_DIM = 74
-
-    def __init__(self, csv_path: str, max_cycles: int = 200, noise_level: float = 0.3):
+    def __init__(self, dim: int, clip: float = 10.0):
         super().__init__()
-
-        self.csv_path    = csv_path
-        self.max_cycles  = max_cycles
-        self.noise_level = noise_level
-
-        # Load all data and compute parameters
-        self.data_loader = WorldSimDataLoader(csv_path)
-
-        # Agent bookkeeping (PettingZoo requires these)
-        self.possible_agents = AGENT_IDS.copy()
-        self.agent_name_mapping = {a: i for i, a in enumerate(self.possible_agents)}
-        self.n_agents = len(self.possible_agents)
-
-        # Spaces
-        self.observation_spaces = {
-            a: spaces.Box(low=-1.0, high=2.0, shape=(self.OBS_DIM,), dtype=np.float32)
-            for a in self.possible_agents
-        }
-        self.action_spaces = {
-            a: spaces.MultiDiscrete([N_ACTIONS, self.n_agents])
-            for a in self.possible_agents
-        }
-
-        # Internal state — all populated in reset()
-        self._state:            Dict[str, Dict]   = {}
-        self._climate_states:   Dict[str, Dict]   = {}
-        self._trade_graph:      Optional[nx.DiGraph] = None
-        self._trade_agreements: Dict              = {}
-        self._alliances:        Dict[str, set]    = {}
-        self._reputation:       Dict[str, float]  = {}
-        self._conflict_matrix:  np.ndarray        = np.zeros((10, 10))
-        self._defection_count:  Dict[str, int]    = {}
-        self._pending_trades:   Dict[str, list]   = {}
-        self._event_log:        list              = []
-        self._cycle:            int               = 0
-
-        # PettingZoo required attributes
-        self.agents: List[str]               = []
-        self.rewards: Dict[str, float]       = {}
-        self._cumulative_rewards: Dict[str, float] = {}
-        self.terminations: Dict[str, bool]   = {}
-        self.truncations:  Dict[str, bool]   = {}
-        self.infos: Dict[str, dict]          = {}
-        self._agent_selector: Optional[agent_selector] = None
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # PettingZoo API properties
-    # ─────────────────────────────────────────────────────────────────────────
-    def observation_space(self, agent: str) -> spaces.Space:
-        return self.observation_spaces[agent]
-
-    def action_space(self, agent: str) -> spaces.Space:
-        return self.action_spaces[agent]
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # RESET
-    # ─────────────────────────────────────────────────────────────────────────
-    def reset(self, seed: Optional[int] = None, options: Optional[dict] = None):
-        if seed is not None:
-            np.random.seed(seed)
-
-        self.agents  = self.possible_agents.copy()
-        self._cycle  = 0
-        self._event_log = []
-
-        # ── Initialise resource states from data ─────────────────────────────
-        self._state = {}
-        for aid in self.agents:
-            init = self.data_loader.region_init[aid]
-            self._state[aid] = {
-                # Resource stocks
-                "water":  init["water_stock"],
-                "food":   init["food_stock"],
-                "energy": init["energy_stock"],
-                "land":   init["land_stock"],
-                # Capabilities
-                "economic_power":      init["economic_power"],
-                "military_strength":   init["military_strength"],
-                "adaptive_capacity":   init["adaptive_capacity"],
-                "social_stability":    init["social_stability"],
-                "population":          init["population_norm"],
-                "trade_openness":      init["trade_openness"],
-                "fin_vulnerability":   init["financial_vulnerability"],
-                "fragility_score":     init["fragility_score"],
-                # Dynamics
-                "water_food_coupling": init["water_food_coupling"],
-                "rainfall_recharge":   init["rainfall_recharge"],
-                # Shock history
-                "drought_freq":  init["drought_freq"],
-                "flood_freq":    init["flood_freq"],
-                "heatwave_freq": init["heatwave_freq"],
-                "storm_freq":    init["storm_freq"],
-                "shock_sev":     init["shock_severity"],
-                # Computed each step
-                "cycles_survived":      0,
-                "n_trade_agreements":   0,
-                "n_alliances":          0,
-                "n_sanctions_against":  0,
-                "n_pending_trades":     0,
-                "last_action":          16,
-                "last_action_success":  0,
-            }
-
-        # ── Climate states from Markov matrices ──────────────────────────────
-        self._climate_states = {}
-        for aid in self.agents:
-            cm = self.data_loader.climate_matrices[aid]
-            self._climate_states[aid] = {
-                "current": cm["last_state"],
-                "history": [cm["last_state"]] * 5,
-                "matrix":  cm["matrix"],
-            }
-
-        # ── Social structures ─────────────────────────────────────────────────
-        self._trade_graph      = copy.deepcopy(self.data_loader.trade_graph)
-        self._trade_agreements = {}
-        self._alliances        = defaultdict(set)
-        self._reputation       = {aid: 0.7 for aid in self.agents}
-        self._defection_count  = defaultdict(int)
-        self._conflict_matrix  = np.zeros((self.n_agents, self.n_agents))
-        self._pending_trades   = defaultdict(list)
-
-        # ── PettingZoo AEC bookkeeping ────────────────────────────────────────
-        self.rewards             = {a: 0.0 for a in self.agents}
-        self._cumulative_rewards = {a: 0.0 for a in self.agents}
-        self.terminations        = {a: False for a in self.agents}
-        self.truncations         = {a: False for a in self.agents}
-        self.infos               = {a: {} for a in self.agents}
-        self._agent_selector     = agent_selector(self.agents)
-        self.agent_selection     = self._agent_selector.reset()
-
-        self._update_conflict_matrix()
-
-        observations = {a: self._observe(a) for a in self.agents}
-        return observations, self.infos
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # STEP
-    # ─────────────────────────────────────────────────────────────────────────
-    def step(self, action):
-        """Process one agent action in the AEC cycle."""
-        agent = self.agent_selection
-
-        # Handle terminated / truncated agents (PettingZoo convention)
-        if self.terminations.get(agent, False) or self.truncations.get(agent, False):
-            self._was_dead_step(action)
-            return
-
-        self._cumulative_rewards[agent] = 0.0
-
-        # Parse action: supports both array and scalar input
-        if hasattr(action, "__len__") and len(action) >= 2:
-            action_type = int(np.clip(action[0], 0, N_ACTIONS - 1))
-            target_idx  = int(np.clip(action[1], 0, self.n_agents - 1))
-        else:
-            action_type = int(np.clip(action, 0, N_ACTIONS - 1))
-            target_idx  = 0
-        target_agent = self.possible_agents[target_idx]
-
-        # Execute
-        success = self._execute_action(agent, action_type, target_agent)
-        self._state[agent]["last_action"]         = action_type
-        self._state[agent]["last_action_success"]  = int(success)
-        self._log_event(agent, action_type, target_agent, success)
-
-        # Advance AEC selector to next agent
-        self.agent_selection = self._agent_selector.next()
-
-        # ── World step: fires after every agent has acted once ────────────────
-        if self._agent_selector.is_last():
-            self._world_step()
-            self._cycle += 1
-
-            for aid in list(self.agents):
-                self.rewards[aid] = self._compute_reward(aid)
-                self._cumulative_rewards[aid] += self.rewards[aid]
-                self._state[aid]["cycles_survived"] += 1
-
-            # Termination / truncation checks
-            for aid in list(self.agents):
-                s = self._state[aid]
-                collapsed = (s["water"] < self.COLLAPSE_THRESHOLD and
-                             s["food"]  < self.COLLAPSE_THRESHOLD)
-                self.terminations[aid] = bool(collapsed)
-                self.truncations[aid]  = (self._cycle >= self.max_cycles)
-
-            self._update_conflict_matrix()
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # ACTION EXECUTION
-    # ─────────────────────────────────────────────────────────────────────────
-    def _execute_action(self, agent: str, action_type: int, target: str) -> bool:
-        s = self._state[agent]
-        success = False
-
-        if action_type == 0:  # invest_water
-            invest = s["economic_power"] * s["adaptive_capacity"] * 0.05
-            s["water"] = min(1.0, s["water"] + invest)
-            success = True
-
-        elif action_type == 1:  # invest_food
-            invest = s["economic_power"] * s["adaptive_capacity"] * 0.04
-            s["food"] = min(1.0, s["food"] + invest)
-            success = True
-
-        elif action_type == 2:  # invest_energy
-            invest = s["economic_power"] * s["adaptive_capacity"] * 0.04
-            s["energy"] = min(1.0, s["energy"] + invest)
-            success = True
-
-        elif action_type == 3:  # stockpile
-            reserve = s["economic_power"] * 0.015
-            for r in ("water", "food", "energy"):
-                s[r] = min(1.0, s[r] + reserve)
-            success = True
-
-        elif action_type == 4:  # population_policy
-            s["population"] = max(0.10, s["population"] * 0.995)
-            success = True
-
-        elif action_type in (5, 6, 7):  # offer trade
-            if target != agent:
-                resource = {5: "water", 6: "food", 7: "energy"}[action_type]
-                if s[resource] > 0.20:
-                    offer_amt = s[resource] * 0.10
-                    self._pending_trades[target].append({
-                        "from": agent, "resource_give": resource,
-                        "amount": offer_amt, "cycle_created": self._cycle,
-                    })
-                    success = True
-
-        elif action_type == 8:  # accept_trade
-            if self._pending_trades[agent]:
-                offer = self._pending_trades[agent].pop(0)
-                self._process_accepted_trade(agent, offer)
-                success = True
-
-        elif action_type == 9:  # reject_trade
-            if self._pending_trades[agent]:
-                self._pending_trades[agent].pop(0)
-                success = True
-
-        elif action_type == 10:  # defect_trade
-            self._process_defection(agent, target)
-            success = True
-
-        elif action_type == 11:  # form_alliance
-            if (target != agent
-                    and target not in self._alliances[agent]
-                    and self._reputation[agent] > 0.40
-                    and self._reputation.get(target, 0.5) > 0.40):
-                self._alliances[agent].add(target)
-                self._alliances[target].add(agent)
-                self._log_event(agent, action_type, target, True, "alliance_formed")
-                success = True
-
-        elif action_type == 12:  # leave_alliance
-            if target in self._alliances[agent]:
-                self._alliances[agent].discard(target)
-                self._alliances[target].discard(agent)
-                self._reputation[agent] = max(0.0, self._reputation[agent] - 0.05)
-                success = True
-
-        elif action_type == 13:  # sanction
-            if target != agent:
-                if self._trade_graph.has_edge(agent, target):
-                    self._trade_graph[agent][target]["active"] = False
-                ts = self._state[target]
-                ts["economic_power"] = max(0.05, ts["economic_power"] - 0.03)
-                s["economic_power"]  = max(0.05, s["economic_power"]  - 0.01)
-                self._state[target]["n_sanctions_against"] += 1
-                success = True
-
-        elif action_type == 14:  # raid
-            if target != agent:
-                ts = self._state[target]
-                raid_prob = (
-                    s["military_strength"] /
-                    (s["military_strength"] + ts["military_strength"] + 1e-9)
-                ) * (1.0 - ts["social_stability"]) * 0.60
-                if np.random.random() < raid_prob:
-                    # Successful raid
-                    steal_w = min(ts["water"], 0.08)
-                    steal_f = min(ts["food"],  0.05)
-                    ts["water"] = max(0.0, ts["water"] - steal_w)
-                    ts["food"]  = max(0.0, ts["food"]  - steal_f)
-                    s["water"]  = min(1.0, s["water"]  + steal_w * 0.75)
-                    s["food"]   = min(1.0, s["food"]   + steal_f * 0.75)
-                    for who in (agent, target):
-                        decay = 0.05 if who == agent else 0.08
-                        self._state[who]["military_strength"] = max(
-                            0.05, self._state[who]["military_strength"] - decay)
-                    self._reputation[agent]   = max(0.0, self._reputation[agent]   - 0.15)
-                    self._defection_count[agent] += 1
-                    success = True
-                else:
-                    # Failed raid — attacker takes damage
-                    s["military_strength"] = max(0.05, s["military_strength"] - 0.08)
-                    s["energy"]            = max(0.00, s["energy"]            - 0.03)
-                    self._reputation[agent] = max(0.0, self._reputation[agent] - 0.05)
-
-        elif action_type == 15:  # diplomat
-            if target != agent:
-                ai = self.possible_agents.index(agent)
-                ti = self.possible_agents.index(target)
-                self._conflict_matrix[ai][ti] = max(
-                    0.0, self._conflict_matrix[ai][ti] - 0.08)
-                self._reputation[agent] = min(1.0, self._reputation[agent] + 0.02)
-                success = True
-
-        elif action_type == 16:  # do_nothing
-            success = True
-
-        # Sync trade/alliance counts
-        s["n_trade_agreements"] = len(self._trade_agreements)
-        s["n_alliances"]        = len(self._alliances[agent])
-        return success
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # TRADE HELPERS
-    # ─────────────────────────────────────────────────────────────────────────
-    def _process_accepted_trade(self, acceptor: str, offer: dict):
-        offerer  = offer["from"]
-        resource = offer["resource_give"]
-        amount   = offer["amount"]
-        s_off    = self._state[offerer]
-        s_acc    = self._state[acceptor]
-
-        transfer = min(s_off[resource], amount)
-        s_off[resource] = max(0.0, s_off[resource] - transfer)
-        s_acc[resource] = min(1.0, s_acc[resource] + transfer * 0.90)
-
-        # Reciprocal payment: acceptor sends a different resource back
-        reciprocal = {"water": "food", "food": "energy", "energy": "water"}
-        give_r    = reciprocal[resource]
-        give_amt  = min(s_acc[give_r], transfer * 0.80)
-        s_acc[give_r] = max(0.0, s_acc[give_r] - give_amt)
-        s_off[give_r] = min(1.0, s_off[give_r] + give_amt * 0.90)
-
-        # Update graph + reputation
-        if not self._trade_graph.has_edge(offerer, acceptor):
-            self._trade_graph.add_edge(
-                offerer, acceptor, weight=transfer,
-                resource_type=resource, volume=transfer, age=0, active=True)
-        else:
-            self._trade_graph[offerer][acceptor]["volume"] += transfer
-            self._trade_graph[offerer][acceptor]["age"]    = 0
-            self._trade_graph[offerer][acceptor]["active"] = True
-
-        for who in (offerer, acceptor):
-            self._reputation[who] = min(1.0, self._reputation[who] + 0.03)
-
-        self._trade_agreements[(offerer, acceptor)] = {
-            "resource": resource, "amount": transfer, "cycle": self._cycle}
-
-    def _process_defection(self, defector: str, victim: str):
-        # Remove agreements involving either party
-        to_remove = [k for k in self._trade_agreements
-                     if defector in k or victim in k]
-        for k in to_remove:
-            del self._trade_agreements[k]
-
-        if self._trade_graph.has_edge(defector, victim):
-            self._trade_graph.remove_edge(defector, victim)
-
-        self._alliances[defector].discard(victim)
-        self._alliances[victim].discard(defector)
-        self._reputation[defector] = max(0.0, self._reputation[defector] - 0.25)
-        self._defection_count[defector] += 1
-
-        # Gossip: observers update conflict probability upward
-        di = self.possible_agents.index(defector)
-        vi = self.possible_agents.index(victim)
-        self._conflict_matrix[di][vi] = min(
-            1.0, self._conflict_matrix[di][vi] + 0.30)
-        self._conflict_matrix[vi][di] = min(
-            1.0, self._conflict_matrix[vi][di] + 0.20)
-        for obs in self.agents:
-            if obs == defector:
-                continue
-            if self._trade_graph.has_edge(defector, obs):
-                oi = self.possible_agents.index(obs)
-                self._conflict_matrix[di][oi] = min(
-                    1.0, self._conflict_matrix[di][oi] + 0.15)
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # WORLD STEP (fires after ALL agents have acted)
-    # ─────────────────────────────────────────────────────────────────────────
-    def _world_step(self):
-        self._apply_climate_shocks()
-        self._apply_depletion()
-        self._apply_nexus_cascades()
-        self._apply_population_dynamics()
-        self._apply_alliance_benefits()
-
-        # Reputation rebuild (slow, if no defections)
-        for aid in self.agents:
-            if self._defection_count[aid] == 0:
-                self._reputation[aid] = min(1.0, self._reputation[aid] + 0.01)
-            self._defection_count[aid] = 0  # reset for next cycle
-
-        # Age trade edges
-        for _, _, d in self._trade_graph.edges(data=True):
-            d["age"] = d.get("age", 0) + 1
-
-    def _apply_climate_shocks(self):
-        """
-        Markov transition per state → determine this cycle's climate event.
-        Shock magnitudes scale with per-state historical shock_severity index.
-        """
-        for aid in self.agents:
-            cs = self._climate_states[aid]
-            probs = cs["matrix"][cs["current"]]
-            next_state = int(np.random.choice(5, p=probs))
-            cs["history"].append(next_state)
-            cs["history"] = cs["history"][-5:]
-            cs["current"]  = next_state
-
-            s   = self._state[aid]
-            sev = s["shock_sev"]
-
-            if next_state == 1:  # Drought
-                mag = 0.05 + sev * 0.12
-                s["water"] = max(0.0, s["water"] - mag)
-                s["food"]  = max(0.0, s["food"]  - mag * 0.40)
-                self._log_event(aid, -1, aid, True, f"drought mag={mag:.3f}")
-
-            elif next_state == 2:  # Flood
-                mag = 0.03 + sev * 0.08
-                s["food"]  = max(0.0, s["food"]  - mag)
-                s["land"]  = max(0.0, s["land"]  - mag * 0.25)
-                s["water"] = min(1.0, s["water"]  + mag * 0.15)
-                self._log_event(aid, -1, aid, True, f"flood mag={mag:.3f}")
-
-            elif next_state == 3:  # Heatwave
-                mag = 0.03 + sev * 0.07
-                s["water"]  = max(0.0, s["water"]  - mag * 1.40)
-                s["food"]   = max(0.0, s["food"]   - mag * 0.80)
-                s["energy"] = max(0.0, s["energy"] - mag * 0.40)
-                self._log_event(aid, -1, aid, True, f"heatwave mag={mag:.3f}")
-
-            elif next_state == 4:  # Storm / Cyclone
-                mag = 0.04 + sev * 0.09
-                s["energy"] = max(0.0, s["energy"] - mag)
-                s["food"]   = max(0.0, s["food"]   - mag * 0.35)
-                s["economic_power"] = max(0.05, s["economic_power"] - mag * 0.25)
-                self._log_event(aid, -1, aid, True, f"storm mag={mag:.3f}")
-
-    def _apply_depletion(self):
-        """
-        Apply data-fitted annual depletion rates to each resource.
-        Rates from LinearRegression over worldsim_merged.csv time series.
-        """
-        for aid in self.agents:
-            s     = self._state[aid]
-            rates = self.data_loader.depletion_rates[aid]
-
-            # Water: rainfall trend + base depletion + recharge
-            water_trend = rates["water"]["slope_frac"]  # positive = increasing rain
-            water_depl  = max(0.005, -water_trend * 0.008) + 0.006
-            water_rech  = s["rainfall_recharge"] * 0.005
-            s["water"]  = float(np.clip(s["water"] - water_depl + water_rech, 0.0, 1.0))
-
-            # Food: demand from population, supply from crop trend
-            food_trend  = rates["food"]["slope_frac"]
-            food_supply = max(0.0, food_trend * 0.005) + 0.002
-            food_demand = s["population"] * 0.010
-            s["food"]   = float(np.clip(s["food"] - food_demand + food_supply, 0.0, 1.0))
-
-            # Energy: capacity expansion trend minus consumption
-            energy_trend = rates["energy"]["slope_frac"]
-            energy_grow  = max(0.0, energy_trend * 0.004)
-            energy_use   = 0.006
-            s["energy"]  = float(np.clip(s["energy"] - energy_use + energy_grow, 0.0, 1.0))
-
-            # Land: slow degradation, partially offset by crop area trend
-            land_trend = rates["land"]["slope_frac"]
-            land_degl  = max(0.001, -land_trend * 0.003) + 0.002
-            s["land"]  = float(np.clip(s["land"] - land_degl, 0.0, 1.0))
-
-    def _apply_nexus_cascades(self):
-        """
-        Water-Food-Energy Nexus cascade triggers (Hoff 2011):
-          Cascade 1: water < 20% → food drops by severity × 60%
-          Cascade 2: energy < 15% → water drops additionally
-          Cascade 3: both water+food critical → population decline
-        """
-        for aid in self.agents:
-            s = self._state[aid]
-
-            # Cascade 1: Water → Food
-            if s["water"] < self.NEXUS_WATER_THRESHOLD:
-                sev = 1.0 - (s["water"] / self.NEXUS_WATER_THRESHOLD)
-                penalty = sev * (1.0 - self.NEXUS_FOOD_MULTIPLIER)
-                s["food"] = max(0.0, s["food"] - penalty * s["water_food_coupling"])
-                self._log_event(aid, -2, aid, True,
-                                f"nexus water→food sev={sev:.2f}")
-
-            # Cascade 2: Energy → Water
-            if s["energy"] < self.NEXUS_ENERGY_THRESHOLD:
-                sev = 1.0 - (s["energy"] / self.NEXUS_ENERGY_THRESHOLD)
-                penalty = sev * (1.0 - self.NEXUS_WATER_MULTIPLIER)
-                s["water"] = max(0.0, s["water"] - penalty * 0.5)
-                self._log_event(aid, -2, aid, True,
-                                f"nexus energy→water sev={sev:.2f}")
-
-            # Cascade 3: Double critical
-            if s["water"] < 0.10 and s["food"] < 0.10:
-                s["population"]      = max(0.01, s["population"] * 0.98)
-                s["social_stability"]= max(0.0,  s["social_stability"] - 0.05)
-                self._log_event(aid, -3, aid, True, "double_collapse")
-
-    def _apply_population_dynamics(self):
-        """Verhulst logistic: dP/dt = r × P × (1 − P/K)"""
-        for aid in self.agents:
-            s  = self._state[aid]
-            K  = max(0.01, s["food"] * 0.50 + s["water"] * 0.30 + s["energy"] * 0.20)
-            P  = s["population"]
-            r  = self.POP_GROWTH_RATE * (1.0 - s["fragility_score"])
-            dP = r * P * (1.0 - P / K)
-            s["population"] = float(np.clip(P + dP * 0.01, 0.01, 2.0))
-
-    def _apply_alliance_benefits(self):
-        """Allies above threshold share surpluses with allies in crisis."""
-        for aid in self.agents:
-            s = self._state[aid]
-            for ally in self._alliances[aid]:
-                if ally not in self.agents:
-                    continue
-                sa = self._state[ally]
-                for resource in ("water", "food", "energy"):
-                    if sa[resource] < 0.30 and s[resource] > 0.50:
-                        share = (s[resource] - 0.40) * 0.10
-                        s[resource]  = max(0.30, s[resource]  - share)
-                        sa[resource] = min(1.0,  sa[resource] + share * 0.90)
-
-    def _update_conflict_matrix(self):
-        """
-        Recompute N×N conflict probability matrix.
-        Formula (Gleditsch et al. 2002):
-          P(conflict_ij) = w1×water_gap + w2×food_stress_i +
-                           w3×fragility_i + w4×defection_hist_i
-        Exponential moving average (α=0.3) smooths abrupt changes.
-        Alliance membership halves conflict probability.
-        """
-        for i, ai in enumerate(self.possible_agents):
-            if ai not in self.agents:
-                continue
-            si = self._state[ai]
-            for j, aj in enumerate(self.possible_agents):
-                if aj not in self.agents or i == j:
-                    continue
-                sj = self._state[aj]
-                water_gap   = max(0.0, sj["water"] - si["water"])
-                food_stress = max(0.0, 0.5 - si["food"]) * 2.0
-                fragility   = si["fragility_score"]
-                def_hist    = min(1.0, self._defection_count[ai] * 0.30)
-
-                in_alliance  = aj in self._alliances.get(ai, set())
-                ally_factor  = 0.20 if in_alliance else 1.0
-
-                raw = (
-                    self.CONFLICT_WATER_W     * water_gap +
-                    self.CONFLICT_FOOD_W       * food_stress +
-                    self.CONFLICT_FRAGILITY_W  * fragility +
-                    self.CONFLICT_HISTORY_W    * def_hist
-                ) * ally_factor
-
-                alpha = 0.30
-                self._conflict_matrix[i][j] = float(np.clip(
-                    alpha * raw + (1 - alpha) * self._conflict_matrix[i][j],
-                    0.0, 1.0))
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # REWARD
-    # ─────────────────────────────────────────────────────────────────────────
-    def _compute_reward(self, agent: str) -> float:
-        """
-        Composite reward with longevity multiplier.
-        Longer survival exponentially amplifies rewards — creates evolutionary
-        pressure toward sustainable over extractive strategies.
-        """
-        s = self._state[agent]
-        t = s["cycles_survived"]
-
-        alive = (s["water"] > self.COLLAPSE_THRESHOLD and
-                 s["food"]  > self.COLLAPSE_THRESHOLD)
-        survival_bonus = 10.0 if alive else -50.0
-
-        # Log-curve resource reward (diminishing returns on hoarding)
-        thresh = {"water": 0.30, "food": 0.30, "energy": 0.20, "land": 0.20}
-        resource_r = sum(
-            np.log(1.0 + s[r] / thresh[r])
-            for r in ("water", "food", "energy", "land")
-        )
-
-        trade_bonus    = s["n_trade_agreements"] * 0.5
-        alliance_bonus = len(self._alliances[agent]) * 1.5
-        reserve_bonus  = sum(
-            0.5 for r in ("water", "food", "energy")
-            if s[r] > thresh.get(r, 0.25) * 1.30
-        )
-
-        idx_i          = self.possible_agents.index(agent)
-        conflict_cost  = float(self._conflict_matrix[idx_i].mean()) * 8.0
-        collapse_pen   = sum(
-            10.0 for r in ("water", "food", "energy")
-            if s[r] < self.COLLAPSE_THRESHOLD
-        )
-        defect_pen     = self._defection_count.get(agent, 0) * 5.0
-
-        longevity = 1.0 + 0.02 * t
-
-        return float((
-            survival_bonus + resource_r + trade_bonus
-            + alliance_bonus + reserve_bonus
-            - conflict_cost - collapse_pen - defect_pen
-        ) * longevity)
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # OBSERVE
-    # ─────────────────────────────────────────────────────────────────────────
-    def _observe(self, agent: str) -> np.ndarray:
-        """
-        Build 74-dimensional observation vector.
-
-        Layout:
-          [ 0: 4]  Own resource stocks          (water, food, energy, land)
-          [ 4: 8]  Own capabilities              (economic_power, military, adaptive, social)
-          [ 8:12]  Own context                   (population, trade_openness, fin_vuln, fragility)
-          [12:17]  Climate state history (5-step)
-          [17:22]  Own shock frequencies         (drought, flood, heat, storm, shock_sev)
-          [22:27]  Trade/social state            (n_trades, n_alliances, rep, n_sanctions, pending)
-          [27:31]  Resource dynamics             (water_food_coupling, recharge, shock_sev, -)
-          [31:71]  Rival observations 10×4       (water_noisy, food_noisy, conflict_prob, ally_flag)
-          [71:74]  Global state                  (cycle/max, n_active_conflicts, global_mean_water)
-        """
-        s   = self._state[agent]
-        obs = np.zeros(self.OBS_DIM, dtype=np.float32)
-
-        # [0:4]
-        obs[0], obs[1], obs[2], obs[3] = s["water"], s["food"], s["energy"], s["land"]
-
-        # [4:8]
-        obs[4] = s["economic_power"]
-        obs[5] = s["military_strength"]
-        obs[6] = s["adaptive_capacity"]
-        obs[7] = s["social_stability"]
-
-        # [8:12]
-        obs[8]  = s["population"]
-        obs[9]  = s["trade_openness"]
-        obs[10] = s["fin_vulnerability"]
-        obs[11] = s["fragility_score"]
-
-        # [12:17] Climate history
-        for k, h in enumerate(self._climate_states[agent]["history"][-5:]):
-            obs[12 + k] = h / 4.0
-
-        # [17:22] Shock frequencies
-        obs[17] = float(np.clip(s["drought_freq"],  0, 1))
-        obs[18] = float(np.clip(s["flood_freq"],    0, 1))
-        obs[19] = float(np.clip(s["heatwave_freq"], 0, 1))
-        obs[20] = float(np.clip(s["storm_freq"],    0, 1))
-        obs[21] = float(np.clip(s["shock_sev"],     0, 1))
-
-        # [22:27] Trade/social
-        obs[22] = float(np.clip(s["n_trade_agreements"] / 5.0, 0, 1))
-        obs[23] = float(np.clip(s["n_alliances"]         / 5.0, 0, 1))
-        obs[24] = float(self._reputation.get(agent, 0.5))
-        obs[25] = float(np.clip(s["n_sanctions_against"] / 3.0, 0, 1))
-        obs[26] = float(np.clip(len(self._pending_trades[agent]) / 5.0, 0, 1))
-
-        # [27:31] Dynamics
-        obs[27] = float(s["water_food_coupling"])
-        obs[28] = float(s["rainfall_recharge"])
-        obs[29] = float(s["shock_sev"])
-        obs[30] = float(s["last_action_success"])
-
-        # [31:71] Rival observations (10 rivals × 4 dims = 40)
-        ai = self.possible_agents.index(agent)
-        for ri, rival in enumerate(self.possible_agents):
-            base = 31 + ri * 4
-            if rival not in self.agents:
-                obs[base:base+4] = [0.5, 0.5, 0.5, 0.0]
-                continue
-            rs = self._state[rival]
-            is_ally   = rival in self._alliances.get(agent, set())
-            has_trade = self._trade_graph.has_edge(agent, rival)
-
-            if is_ally:
-                noise = self.noise_level * 0.10
-            elif has_trade:
-                noise = self.noise_level * 0.45
-            else:
-                noise = self.noise_level
-
-            def noisy(v: float) -> float:
-                return float(np.clip(
-                    v * (1 - noise) + np.random.normal(0, noise * 0.10),
-                    0.0, 1.0))
-
-            obs[base]   = noisy(rs["water"])
-            obs[base+1] = noisy(rs["food"])
-            obs[base+2] = float(self._conflict_matrix[ai][ri])
-            obs[base+3] = float(is_ally)
-
-        # [71:74] Global state
-        obs[71] = float(self._cycle / self.max_cycles)
-        obs[72] = float(np.clip((self._conflict_matrix > 0.60).sum() / 20.0, 0, 1))
-        alive_water = [self._state[a]["water"] for a in self.agents]
-        obs[73] = float(np.mean(alive_water)) if alive_water else 0.5
-
-        return obs.astype(np.float32)
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # UTILITY METHODS (PettingZoo API + helpers for visualisation)
-    # ─────────────────────────────────────────────────────────────────────────
-    def observe(self, agent: str) -> np.ndarray:
-        return self._observe(agent)
-
-    def _was_dead_step(self, action):
-        """PettingZoo convention for handling dead agents."""
-        agent = self.agent_selection
-        self._cumulative_rewards[agent] = 0.0
-        remaining = [a for a in self.agents
-                     if not (self.terminations.get(a, False) or
-                             self.truncations.get(a, False))]
-        self.agents          = remaining
-        self._agent_selector = agent_selector(self.agents) if self.agents else agent_selector([])
-        self.agent_selection = self._agent_selector.reset() if self.agents else None
-
-    def render(self, mode: str = "human"):
-        print(f"\n{'='*65}")
-        print(f"  Cycle {self._cycle:>3}  |  Active: {len(self.agents)}/{self.n_agents}")
-        print(f"{'─'*65}")
-        hdr = f"  {'ID':<4} {'State':<22} {'Water':>6} {'Food':>6} "
-        hdr += f"{'Energy':>7} {'Rep':>5} {'Ally':>5} {'Conf':>6}"
-        print(hdr)
-        for aid in self.possible_agents:
-            if aid not in self.agents:
-                print(f"  {aid:<4} {'COLLAPSED':^22}")
-                continue
-            s   = self._state[aid]
-            idx = self.possible_agents.index(aid)
-            rep = self._reputation.get(aid, 0.0)
-            ali = len(self._alliances[aid])
-            con = float(self._conflict_matrix[idx].mean())
-            sname = STATE_AGENTS[aid][:20]
-            print(f"  {aid:<4} {sname:<22} {s['water']:>6.3f} {s['food']:>6.3f} "
-                  f"{s['energy']:>7.3f} {rep:>5.2f} {ali:>5d} {con:>6.3f}")
-        print(f"{'─'*65}")
-        if self._event_log:
-            for e in self._event_log[-4:]:
-                if e["action"].startswith("event_"):
-                    continue
-                tick = "✓" if e["success"] else "✗"
-                note = f" [{e['note']}]" if e.get("note") else ""
-                print(f"  [{e['cycle']:>3}] {e['agent']}→{e['action']}→{e['target']} "
-                      f"({tick}){note}")
-        print()
-
-    def get_state_df(self) -> pd.DataFrame:
-        """Return current world state as a tidy DataFrame (for visualisation)."""
-        rows = []
-        for aid in self.possible_agents:
-            status = "active" if aid in self.agents else "collapsed"
-            row: dict = {
-                "agent_id":   aid,
-                "state_name": STATE_AGENTS[aid],
-                "status":     status,
-                "cycle":      self._cycle,
-            }
-            if aid in self.agents:
-                s = self._state[aid]
-                row.update({k: v for k, v in s.items()
-                            if isinstance(v, (int, float))})
-                row["reputation"]   = self._reputation.get(aid, 0.5)
-                row["n_allies"]     = len(self._alliances[aid])
-                row["avg_conflict"] = float(
-                    self._conflict_matrix[self.possible_agents.index(aid)].mean())
-                row["climate"] = CLIMATE_STATES[
-                    self._climate_states[aid]["current"]]
-            rows.append(row)
-        return pd.DataFrame(rows)
-
-    def get_conflict_df(self) -> pd.DataFrame:
-        return pd.DataFrame(
-            self._conflict_matrix,
-            index=self.possible_agents,
-            columns=self.possible_agents)
-
-    def get_trade_graph(self) -> nx.DiGraph:
-        return self._trade_graph
-
-    def get_event_log(self) -> pd.DataFrame:
-        return pd.DataFrame(self._event_log)
-
-    # ─────────────────────────────────────────────────────────────────────────
-    def _log_event(self, agent: str, action_type: int, target: str,
-                   success: bool, note: str = ""):
-        action_name = ACTION_TYPES.get(action_type, f"event_{action_type}")
-        s = self._state.get(agent, {})
-        self._event_log.append({
-            "cycle":   self._cycle,
-            "agent":   agent,
-            "action":  action_name,
-            "target":  target,
-            "success": success,
-            "note":    note,
-            "water":   s.get("water", 0.0),
-            "food":    s.get("food",  0.0),
-            "energy":  s.get("energy",0.0),
-        })
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# SECTION 5 — VISUALISATION
-# ══════════════════════════════════════════════════════════════════════════════
-
-def run_visualisation(csv_path: str, n_cycles: int = 100, random_seed: int = 42):
+        self.clip = clip
+        self.register_buffer("mean",  torch.zeros(dim))
+        self.register_buffer("var",   torch.ones(dim))
+        self.register_buffer("count", torch.tensor(1e-4))
+
+    def update(self, x: torch.Tensor):
+        """Update statistics with a batch of observations (no grad required)."""
+        with torch.no_grad():
+            b_mean  = x.mean(0)
+            b_var   = x.var(0, unbiased=False)
+            b_count = torch.tensor(float(x.shape[0]), device=x.device)
+            total   = self.count + b_count
+            delta   = b_mean - self.mean
+            new_mean = self.mean + delta * b_count / total
+            m_a = self.var   * self.count
+            m_b = b_var      * b_count
+            m2  = m_a + m_b + delta ** 2 * self.count * b_count / total
+            self.mean  = new_mean
+            self.var   = m2 / total
+            self.count = total
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        std = torch.sqrt(self.var + 1e-8)
+        return torch.clamp((x - self.mean) / std, -self.clip, self.clip)
+
+
+class ActorNetwork(nn.Module):
     """
-    Run WorldSim India with a random policy and produce 11 diagnostic plots.
-    Replace random actions with your trained MAPPO agents for real results.
+    Decentralised actor: maps one agent's 74-dim observation →
+        (action_type logits [17], target logits [10]).
+
+    Parameter-shared across all 10 agents (MAPPO standard practice).
+    The agent's one-hot ID is appended to the observation so the shared
+    network can learn state-specific policies.
+
+    Architecture: obs+id → LayerNorm → FC → ReLU → FC → ReLU → dual heads
+    """
+    def __init__(self, obs_dim: int, n_agents: int, n_actions: int, n_targets: int,
+                 hidden: List[int]):
+        super().__init__()
+        input_dim = obs_dim + n_agents  # obs + one-hot agent ID
+
+        layers: List[nn.Module] = [nn.LayerNorm(input_dim)]
+        in_d = input_dim
+        for h in hidden:
+            layers += [nn.Linear(in_d, h), nn.ReLU()]
+            in_d = h
+        self.backbone = nn.Sequential(*layers)
+
+        # Dual head: separate logits for (action_type, target_agent)
+        self.action_head = nn.Linear(in_d, n_actions)
+        self.target_head = nn.Linear(in_d, n_targets)
+
+        # Orthogonal initialisation (recommended for PPO actors)
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.orthogonal_(m.weight, gain=np.sqrt(2))
+                nn.init.zeros_(m.bias)
+        # Output heads: smaller scale
+        nn.init.orthogonal_(self.action_head.weight, gain=0.01)
+        nn.init.orthogonal_(self.target_head.weight, gain=0.01)
+
+    def forward(
+        self,
+        obs: torch.Tensor,          # (batch, obs_dim)
+        agent_id: torch.Tensor,     # (batch,) — integer agent index
+        action_mask: Optional[torch.Tensor] = None,   # (batch, n_actions)
+        target_mask: Optional[torch.Tensor] = None,   # (batch, n_targets)
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Returns (action_logits, target_logits)."""
+        one_hot = F.one_hot(agent_id, num_classes=self.backbone[0].normalized_shape[0]
+                            - obs.shape[-1]).float()
+        x = torch.cat([obs, one_hot], dim=-1)
+        feat = self.backbone(x)
+        act_logits = self.action_head(feat)
+        tgt_logits = self.target_head(feat)
+
+        # Mask unavailable actions (e.g. do_nothing mask is never needed)
+        if action_mask is not None:
+            act_logits = act_logits.masked_fill(action_mask == 0, -1e9)
+        if target_mask is not None:
+            tgt_logits = tgt_logits.masked_fill(target_mask == 0, -1e9)
+
+        return act_logits, tgt_logits
+
+    def get_action(
+        self,
+        obs: torch.Tensor,
+        agent_id: torch.Tensor,
+        deterministic: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Sample or take greedy action.
+        Returns: action_type, target_idx, log_prob, entropy
+        """
+        act_logits, tgt_logits = self.forward(obs, agent_id)
+        act_dist = Categorical(logits=act_logits)
+        tgt_dist = Categorical(logits=tgt_logits)
+
+        if deterministic:
+            act = act_logits.argmax(-1)
+            tgt = tgt_logits.argmax(-1)
+        else:
+            act = act_dist.sample()
+            tgt = tgt_dist.sample()
+
+        # Joint log-probability: log P(action, target) = log P(action) + log P(target)
+        log_prob = act_dist.log_prob(act) + tgt_dist.log_prob(tgt)
+        entropy  = act_dist.entropy() + tgt_dist.entropy()
+        return act, tgt, log_prob, entropy
+
+
+class CriticNetwork(nn.Module):
+    """
+    Centralised critic (CTDE — Centralised Training Decentralised Execution).
+    Input: all agents' observations concatenated → scalar value estimate.
+    This is the key MAPPO innovation: the critic has global state access during
+    training, allowing much better advantage estimation than independent critics.
+
+    Architecture: global_obs → LayerNorm → FC → ReLU → FC → ReLU → value
+    """
+    def __init__(self, obs_dim: int, n_agents: int, hidden: List[int]):
+        super().__init__()
+        global_dim = obs_dim * n_agents  # concatenate all obs
+
+        layers: List[nn.Module] = [nn.LayerNorm(global_dim)]
+        in_d = global_dim
+        for h in hidden:
+            layers += [nn.Linear(in_d, h), nn.ReLU()]
+            in_d = h
+        layers.append(nn.Linear(in_d, 1))
+        self.net = nn.Sequential(*layers)
+
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.orthogonal_(m.weight, gain=np.sqrt(2))
+                nn.init.zeros_(m.bias)
+        # Value head
+        nn.init.orthogonal_(self.net[-1].weight, gain=1.0)
+
+    def forward(self, global_obs: torch.Tensor) -> torch.Tensor:
+        """
+        global_obs: (batch, obs_dim * n_agents) — all agents' obs concatenated.
+        Returns:    (batch, 1) value estimates.
+        """
+        return self.net(global_obs)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 3 — ROLLOUT BUFFER
+# ══════════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class Transition:
+    """Single agent-step transition stored in the rollout buffer."""
+    obs:         np.ndarray   # (obs_dim,)
+    global_obs:  np.ndarray   # (obs_dim * n_agents,)
+    agent_id:    int
+    action_type: int
+    target_idx:  int
+    log_prob:    float
+    reward:      float
+    done:        bool
+    value:       float
+
+
+class RolloutBuffer:
+    """
+    Stores one complete episode worth of transitions per agent.
+    Computes GAE-λ advantage estimates at episode end.
+    """
+
+    def __init__(self, config: MAPPOConfig):
+        self.cfg = config
+        self.clear()
+
+    def clear(self):
+        self.transitions: List[Transition] = []
+
+    def push(self, t: Transition):
+        self.transitions.append(t)
+
+    def compute_advantages_and_returns(
+        self, last_values: Dict[str, float]
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        GAE-λ advantage estimation (Schulman et al. 2015).
+        Processes each agent's timeline independently, then flattens.
+
+        Returns advantages (N,) and returns (N,) for all stored transitions.
+        """
+        cfg = self.cfg
+        n   = len(self.transitions)
+        if n == 0:
+            return np.array([]), np.array([])
+
+        advantages = np.zeros(n, dtype=np.float32)
+        returns    = np.zeros(n, dtype=np.float32)
+
+        # Group by agent for per-agent GAE
+        agent_indices: Dict[int, List[int]] = defaultdict(list)
+        for i, t in enumerate(self.transitions):
+            agent_indices[t.agent_id].append(i)
+
+        for aid_idx, idxs in agent_indices.items():
+            aid = AGENT_IDS[aid_idx]
+            vals = [self.transitions[i].value for i in idxs]
+            rwds = [self.transitions[i].reward for i in idxs]
+            done = [self.transitions[i].done   for i in idxs]
+
+            # Bootstrap from last value if episode didn't end in collapse
+            last_v = last_values.get(aid, 0.0) if not done[-1] else 0.0
+
+            gae = 0.0
+            for j in reversed(range(len(idxs))):
+                next_v = vals[j + 1] if j + 1 < len(idxs) else last_v
+                mask   = 0.0 if done[j] else 1.0
+                delta  = rwds[j] + cfg.gamma * next_v * mask - vals[j]
+                gae    = delta + cfg.gamma * cfg.gae_lambda * mask * gae
+                advantages[idxs[j]] = gae
+                returns[idxs[j]]    = gae + vals[j]
+
+        return advantages, returns
+
+    def get_tensors(
+        self, advantages: np.ndarray, returns: np.ndarray
+    ) -> Dict[str, torch.Tensor]:
+        """Collate buffer into training tensors."""
+        obs         = np.stack([t.obs        for t in self.transitions])
+        global_obs  = np.stack([t.global_obs for t in self.transitions])
+        agent_ids   = np.array([t.agent_id   for t in self.transitions])
+        act_types   = np.array([t.action_type for t in self.transitions])
+        tgt_idxs    = np.array([t.target_idx  for t in self.transitions])
+        log_probs   = np.array([t.log_prob    for t in self.transitions])
+        values      = np.array([t.value       for t in self.transitions])   # ← ADD THIS
+
+        return {
+            "obs":        torch.FloatTensor(obs).to(DEVICE),
+            "global_obs": torch.FloatTensor(global_obs).to(DEVICE),
+            "agent_ids":  torch.LongTensor(agent_ids).to(DEVICE),
+            "act_types":  torch.LongTensor(act_types).to(DEVICE),
+            "tgt_idxs":   torch.LongTensor(tgt_idxs).to(DEVICE),
+            "log_probs":  torch.FloatTensor(log_probs).to(DEVICE),
+            "advantages": torch.FloatTensor(advantages).to(DEVICE),
+            "returns":    torch.FloatTensor(returns).to(DEVICE),
+            "values":     torch.FloatTensor(values).to(DEVICE),          # ← NEW
+        }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 4 — MAPPO TRAINER
+# ══════════════════════════════════════════════════════════════════════════════
+
+class MAPPOTrainer:
+    """
+    Full MAPPO training loop for WorldSim India.
+
+    Training loop per episode:
+      1.  Reset environment
+      2.  Roll out episode, collecting (obs, action, reward, value) per agent step
+      3.  Compute GAE-λ advantages and returns
+      4.  Run n_epochs PPO update passes over minibatches
+      5.  Log metrics, decay LR, decay entropy coefficient
+      6.  Periodically evaluate and save checkpoint
+
+    The centralised critic sees ALL agents' observations concatenated
+    (global state). Only the actor is deployed at inference time.
+    """
+
+    def __init__(self, csv_path: str, config: Optional[MAPPOConfig] = None):
+        self.cfg = config or MAPPOConfig(csv_path=csv_path)
+        self.cfg.csv_path = csv_path
+
+        # ── Environment ──────────────────────────────────────────────────────
+        self.env = WorldSimIndiaEnv(
+            csv_path=self.cfg.csv_path,
+            max_cycles=self.cfg.max_cycles,
+            noise_level=self.cfg.noise_level,
+        )
+
+        # ── Networks ─────────────────────────────────────────────────────────
+        self.actor = ActorNetwork(
+            obs_dim   = self.cfg.obs_dim,
+            n_agents  = self.cfg.n_agents,
+            n_actions = self.cfg.n_actions,
+            n_targets = self.cfg.n_targets,
+            hidden    = self.cfg.actor_hidden,
+        ).to(DEVICE)
+
+        self.critic = CriticNetwork(
+            obs_dim   = self.cfg.obs_dim,
+            n_agents  = self.cfg.n_agents,
+            hidden    = self.cfg.critic_hidden,
+        ).to(DEVICE)
+
+        # ── Observation normaliser (shared across all agents) ─────────────────
+        self.obs_norm = RunningNorm(self.cfg.obs_dim).to(DEVICE)
+
+        # ── Reward normaliser ─────────────────────────────────────────────────
+        if self.cfg.normalise_rewards:
+            self.reward_norm = RunningNorm(1).to(DEVICE)  # scalar rewards
+
+        # ── Optimisers ────────────────────────────────────────────────────────
+        self.actor_opt  = Adam(self.actor.parameters(),  lr=self.cfg.lr_actor)
+        self.critic_opt = Adam(self.critic.parameters(), lr=self.cfg.lr_critic)
+
+        # ── LR schedulers ─────────────────────────────────────────────────────
+        self.actor_sched  = torch.optim.lr_scheduler.ExponentialLR(
+            self.actor_opt,  gamma=self.cfg.lr_decay)
+        self.critic_sched = torch.optim.lr_scheduler.ExponentialLR(
+            self.critic_opt, gamma=self.cfg.lr_decay)
+
+        # ── Buffer ────────────────────────────────────────────────────────────
+        self.buffer = RolloutBuffer(self.cfg)
+
+        # ── Metrics ───────────────────────────────────────────────────────────
+        self.episode_returns:    List[Dict[str, float]] = []
+        self.episode_lengths:    List[int]              = []
+        self.episode_survivors:  List[int]              = []
+        self.ppo_losses:         List[Dict[str, float]] = []
+        self.eval_returns:       List[float]            = []
+        self._best_eval_return:  float                  = -np.inf
+
+        # ── Misc ──────────────────────────────────────────────────────────────
+        os.makedirs(self.cfg.checkpoint_dir, exist_ok=True)
+        self._episode = 0
+
+        n_actor  = sum(p.numel() for p in self.actor.parameters()  if p.requires_grad)
+        n_critic = sum(p.numel() for p in self.critic.parameters() if p.requires_grad)
+        print(f"\n[MAPPO] Actor params:  {n_actor:,}")
+        print(f"[MAPPO] Critic params: {n_critic:,}")
+        print(f"[MAPPO] Config: episodes={self.cfg.n_episodes}  "
+              f"cycles/ep={self.cfg.max_cycles}  n_epochs={self.cfg.n_epochs}")
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # HELPERS
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _entropy_coeff(self) -> float:
+        """Linearly decay entropy coefficient from start to end."""
+        frac = min(1.0, self._episode / max(1, self.cfg.entropy_decay_eps))
+        return self.cfg.entropy_start + frac * (
+            self.cfg.entropy_end - self.cfg.entropy_start)
+
+    def _team_weight(self) -> float:
+        """Curriculum: linearly decay team reward weighting."""
+        frac = min(1.0, self._episode / max(1, self.cfg.n_episodes))
+        return self.cfg.curriculum_start + frac * (
+            self.cfg.curriculum_end - self.cfg.curriculum_start)
+
+    def _get_global_obs(self, obs_dict: Dict[str, np.ndarray]) -> np.ndarray:
+        """Concatenate all agents' observations into global state vector."""
+        return np.concatenate(
+            [obs_dict.get(aid, np.zeros(self.cfg.obs_dim, dtype=np.float32))
+             for aid in AGENT_IDS]
+        )
+
+    def _obs_to_tensor(self, obs: np.ndarray) -> torch.Tensor:
+        t = torch.FloatTensor(obs).unsqueeze(0).to(DEVICE)
+        if self.cfg.normalise_obs:
+            t = self.obs_norm(t)
+        return t
+
+    @torch.no_grad()
+    def _get_value(self, global_obs_np: np.ndarray) -> float:
+        t = torch.FloatTensor(global_obs_np).unsqueeze(0).to(DEVICE)
+        return float(self.critic(t).squeeze())
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # COLLECT ROLLOUT
+    # ─────────────────────────────────────────────────────────────────────────
+
+    @torch.no_grad()
+    def collect_rollout(self, deterministic: bool = False) -> Dict[str, float]:
+        """
+        Run one full episode, storing transitions in the buffer.
+        Returns per-agent episode returns for logging.
+        """
+        self.buffer.clear()
+        obs_dict, _ = self.env.reset(seed=self._episode if not deterministic else 9999)
+
+        episode_returns: Dict[str, float] = defaultdict(float)
+        current_obs = dict(obs_dict)  # mutable copy
+
+        # Update obs normaliser with initial observations
+        if self.cfg.normalise_obs and not deterministic:
+            obs_batch = torch.FloatTensor(
+                np.stack(list(obs_dict.values()))).to(DEVICE)
+            self.obs_norm.update(obs_batch)
+
+        for step in range(self.cfg.max_cycles):
+            if not self.env.agents:
+                break
+
+            # Active agent this AEC step
+            agent = self.env.agent_selection
+            if self.env.terminations.get(agent, False) or \
+               self.env.truncations.get(agent, False):
+                try:
+                    self.env.step(np.array([16, 0]))  # do_nothing for dead agent
+                except Exception:
+                    pass
+                continue
+
+            aid_idx = AGENT_IDS.index(agent)
+            obs_np  = current_obs.get(agent, np.zeros(self.cfg.obs_dim, dtype=np.float32))
+
+            # Build global obs for critic
+            global_obs_np = self._get_global_obs(current_obs)
+
+            # Actor: sample action
+            obs_t   = self._obs_to_tensor(obs_np)
+            aid_t   = torch.LongTensor([aid_idx]).to(DEVICE)
+            act, tgt, log_prob, _ = self.actor.get_action(
+                obs_t, aid_t, deterministic=deterministic)
+
+            action_type = int(act.item())
+            target_idx  = int(tgt.item())
+            log_prob_f  = float(log_prob.item())
+
+            # Critic: estimate value
+            value = self._get_value(global_obs_np)
+
+            # Step environment
+            action = np.array([action_type, target_idx])
+            self.env.step(action)
+
+            reward = float(self.env.rewards.get(agent, 0.0))
+            done   = (self.env.terminations.get(agent, False) or
+                      self.env.truncations.get(agent, False))
+
+            # NEW: Clip reward for stability
+            reward = np.clip(reward, -self.cfg.reward_clip, self.cfg.reward_clip)
+
+            # NEW: Normalize reward if enabled
+            if self.cfg.normalise_rewards and not deterministic:
+                reward_t = torch.tensor([[reward]]).to(DEVICE)
+                self.reward_norm.update(reward_t)
+                reward = float(self.reward_norm(reward_t).item())
+
+            # Curriculum: blend individual + team reward
+            team_w = self._team_weight()
+            if not deterministic and len(self.env.agents) > 0:
+                team_reward = float(np.mean(
+                    [self.env.rewards.get(a, 0.0) for a in self.env.agents]))
+                team_reward = np.clip(team_reward, -self.cfg.reward_clip, self.cfg.reward_clip)
+                reward = (1 - team_w) * reward + team_w * team_reward
+
+            episode_returns[agent] += reward
+
+            # Store transition
+            self.buffer.push(Transition(
+                obs        = obs_np,
+                global_obs = global_obs_np,
+                agent_id   = aid_idx,
+                action_type= action_type,
+                target_idx = target_idx,
+                log_prob   = log_prob_f,
+                reward     = reward,
+                done       = done,
+                value      = value,
+            ))
+
+            # Update current obs
+            if not done:
+                new_obs = self.env._observe(agent)
+                current_obs[agent] = new_obs
+                if self.cfg.normalise_obs and not deterministic:
+                    t = torch.FloatTensor(new_obs).unsqueeze(0).to(DEVICE)
+                    self.obs_norm.update(t)
+
+        return dict(episode_returns)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # PPO UPDATE
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def ppo_update(self) -> Dict[str, float]:
+        """
+        Run n_epochs PPO updates over minibatches of the stored rollout.
+
+        PPO clipped objective (Schulman et al. 2017):
+          L_CLIP = E[min(r_t × A_t, clip(r_t, 1-ε, 1+ε) × A_t)]
+        where r_t = π(a|s) / π_old(a|s) is the probability ratio.
+
+        Combined loss:
+          L = -L_CLIP + v_coeff × L_VALUE - entropy_coeff × H[π]
+
+        Improvements: 
+        - Value clipping for stability
+        - Early stopping if KL divergence exceeds target
+        - Approx KL monitoring
+        """
+        # Bootstrap values for agents still alive at episode end
+        last_values = {}
+        if self.cfg.normalise_obs:
+            for aid in AGENT_IDS:
+                if aid in self.env.agents:
+                    global_obs = self._get_global_obs(
+                        {a: self.env._observe(a) for a in self.env.agents})
+                    last_values[aid] = self._get_value(global_obs)
+                else:
+                    last_values[aid] = 0.0
+        else:
+            last_values = {aid: 0.0 for aid in AGENT_IDS}
+
+        advantages, returns = self.buffer.compute_advantages_and_returns(last_values)
+
+        if len(advantages) == 0:
+            return {"policy_loss": 0, "value_loss": 0, "entropy": 0, "total_loss": 0, "approx_kl": 0}
+
+        # Normalise advantages (reduces variance)
+        if self.cfg.normalise_returns:
+            adv_std = advantages.std()
+            if adv_std > 1e-8:
+                advantages = (advantages - advantages.mean()) / (adv_std + 1e-8)
+
+        batch = self.buffer.get_tensors(advantages, returns)
+        n     = len(advantages)
+        ent_c = self._entropy_coeff()
+
+        metrics: Dict[str, List[float]] = defaultdict(list)
+
+        for epoch in range(self.cfg.n_epochs):
+            # Shuffle indices for minibatch sampling
+            perm = torch.randperm(n, device=DEVICE)
+            approx_kl = 0.0
+
+            for start in range(0, n, self.cfg.minibatch_size):
+                idx = perm[start: start + self.cfg.minibatch_size]
+                if len(idx) < 2:
+                    continue
+
+                obs       = batch["obs"][idx]
+                glob_obs  = batch["global_obs"][idx]
+                agent_ids = batch["agent_ids"][idx]
+                act_types = batch["act_types"][idx]
+                tgt_idxs  = batch["tgt_idxs"][idx]
+                old_lp    = batch["log_probs"][idx]
+                adv       = batch["advantages"][idx]
+                ret       = batch["returns"][idx]
+
+                # ── Actor loss ────────────────────────────────────────────────
+                act_logits, tgt_logits = self.actor(obs, agent_ids)
+                act_dist = Categorical(logits=act_logits)
+                tgt_dist = Categorical(logits=tgt_logits)
+
+                new_lp = act_dist.log_prob(act_types) + \
+                         tgt_dist.log_prob(tgt_idxs)
+                entropy = act_dist.entropy() + tgt_dist.entropy()
+
+                # Probability ratio
+                ratio = torch.exp(new_lp - old_lp)
+
+                # Clipped surrogate
+                surr1 = ratio * adv
+                surr2 = torch.clamp(ratio, 1 - self.cfg.clip_eps,
+                                    1 + self.cfg.clip_eps) * adv
+                policy_loss = -torch.min(surr1, surr2).mean()
+
+                # ── Critic loss ───────────────────────────────────────────────
+                values = self.critic(glob_obs).squeeze(-1)
+                old_values = batch["values"][idx]
+                values_clipped = old_values + torch.clamp(
+                    values - old_values, -self.cfg.clip_eps, self.cfg.clip_eps
+                )
+
+                # More stable version — penalize the worse deviation
+                value_loss = torch.mean(
+                    torch.max(
+                        (values - ret) ** 2,
+                        (values_clipped - ret) ** 2
+                    )
+                )
+
+                # ── Combined loss ─────────────────────────────────────────────
+                loss = (policy_loss
+                        + self.cfg.value_coeff  * value_loss
+                        - ent_c                 * entropy.mean())
+
+                # ── Approx KL for early stopping ──────────────────────────────
+                kl = (old_lp - new_lp).mean().item()
+                approx_kl += kl
+
+                # ── Backprop ──────────────────────────────────────────────────
+                self.actor_opt.zero_grad()
+                self.critic_opt.zero_grad()
+                loss.backward()
+                nn.utils.clip_grad_norm_(
+                    list(self.actor.parameters()) +
+                    list(self.critic.parameters()),
+                    self.cfg.max_grad_norm)
+                self.actor_opt.step()
+                self.critic_opt.step()
+
+                metrics["policy_loss"].append(float(policy_loss))
+                metrics["value_loss"].append(float(value_loss))
+                metrics["entropy"].append(float(entropy.mean()))
+                metrics["total_loss"].append(float(loss))
+                metrics["ratio_mean"].append(float(ratio.mean()))
+                metrics["clip_frac"].append(
+                    float((torch.abs(ratio - 1) > self.cfg.clip_eps).float().mean()))
+
+            # Early stopping if KL too high
+            approx_kl /= (n / self.cfg.minibatch_size)
+            metrics["approx_kl"].append(approx_kl)
+            if approx_kl > self.cfg.target_kl:
+                break
+
+        return {k: float(np.mean(v)) for k, v in metrics.items() if v}
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # EVALUATE (no exploration noise, deterministic policy)
+    # ─────────────────────────────────────────────────────────────────────────
+
+    @torch.no_grad()
+    def evaluate(self, n_eval: int = 3) -> Dict[str, float]:
+        """
+        Run n_eval deterministic episodes and return aggregate metrics.
+        Captures the five emergent behaviours described in the WorldSim blueprint.
+        """
+        self.actor.eval()
+        self.critic.eval()
+
+        agg_returns:   List[float] = []
+        agg_survivors: List[int]   = []
+        agg_alliances: List[float] = []
+        agg_trades:    List[float] = []
+        agg_conflicts: List[float] = []
+
+        for _ in range(n_eval):
+            ep_returns = self.collect_rollout(deterministic=True)
+            agg_returns.append(float(np.mean(list(ep_returns.values()))))
+            agg_survivors.append(len(self.env.agents))
+            agg_alliances.append(
+                float(np.mean([len(self.env._alliances[a])
+                               for a in AGENT_IDS])))
+            agg_trades.append(float(len(self.env._trade_agreements)))
+            agg_conflicts.append(
+                float(self.env._conflict_matrix.mean()))
+
+        self.actor.train()
+        self.critic.train()
+
+        return {
+            "eval_return":     float(np.mean(agg_returns)),
+            "eval_survivors":  float(np.mean(agg_survivors)),
+            "eval_alliances":  float(np.mean(agg_alliances)),
+            "eval_trades":     float(np.mean(agg_trades)),
+            "eval_conflict":   float(np.mean(agg_conflicts)),
+        }
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # CHECKPOINT
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def save_checkpoint(self, tag: str = ""):
+        fname = os.path.join(
+            self.cfg.checkpoint_dir,
+            f"worldsim_india_ep{self._episode}{('_' + tag) if tag else ''}.pt")
+        torch.save({
+            "episode":      self._episode,
+            "actor":        self.actor.state_dict(),
+            "critic":       self.critic.state_dict(),
+            "actor_opt":    self.actor_opt.state_dict(),
+            "critic_opt":   self.critic_opt.state_dict(),
+            "obs_norm":     self.obs_norm.state_dict(),
+            "reward_norm":  self.reward_norm.state_dict() if self.cfg.normalise_rewards else None,
+            "config":       self.cfg,
+            "best_eval":    self._best_eval_return,
+        }, fname)
+        print(f"  [ckpt] Saved → {fname}")
+
+    def load_checkpoint(self, path: str):
+        ckpt = torch.load(path, map_location=DEVICE)
+        self.actor.load_state_dict(ckpt["actor"])
+        self.critic.load_state_dict(ckpt["critic"])
+        self.actor_opt.load_state_dict(ckpt["actor_opt"])
+        self.critic_opt.load_state_dict(ckpt["critic_opt"])
+        self.obs_norm.load_state_dict(ckpt["obs_norm"])
+        if self.cfg.normalise_rewards and "reward_norm" in ckpt:
+            self.reward_norm.load_state_dict(ckpt["reward_norm"])
+        self._episode = ckpt["episode"]
+        self._best_eval_return = ckpt.get("best_eval", -np.inf)
+        print(f"  [ckpt] Loaded from {path} (episode {self._episode})")
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # MAIN TRAINING LOOP
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def train(self, n_episodes: Optional[int] = None) -> pd.DataFrame:
+        """
+        Main training loop.  Returns a DataFrame of training metrics per episode.
+
+        Per episode:
+          1. collect_rollout  → fills buffer, returns episode_returns dict
+          2. ppo_update       → runs n_epochs of PPO over the buffer
+          3. log metrics
+          4. (optional) evaluate → deterministic policy assessment
+          5. (optional) save checkpoint
+        """
+        n_eps = n_episodes or self.cfg.n_episodes
+        log_rows: List[dict] = []
+
+        # Rolling windows for smoothed logging
+        ret_window   = deque(maxlen=20)
+        surv_window  = deque(maxlen=20)
+
+        print(f"\n{'='*70}")
+        print(f"  WorldSim India MAPPO Training")
+        print(f"  Episodes: {n_eps}  |  Cycles/ep: {self.cfg.max_cycles}")
+        print(f"  Actor arch: {self.cfg.actor_hidden}  "
+              f"Critic arch: {self.cfg.critic_hidden}")
+        print(f"{'='*70}")
+        print(f"  {'Ep':>5} {'MeanRet':>9} {'SmoothR':>9} {'Surv':>5} "
+              f"{'PLoss':>8} {'VLoss':>8} {'Ent':>7} "
+              f"{'Clip%':>7} {'KL':>7} {'LR_a':>8} {'Time':>6}")
+        print(f"  {'─'*5} {'─'*9} {'─'*9} {'─'*5} "
+              f"{'─'*8} {'─'*8} {'─'*7} "
+              f"{'─'*7} {'─'*7} {'─'*8} {'─'*6}")
+
+        t0_total = time.time()
+
+        for ep in range(n_eps):
+            self._episode = ep
+            t0_ep = time.time()
+
+            # 1. Collect rollout
+            ep_returns = self.collect_rollout(deterministic=False)
+            n_alive    = len(self.env.agents)
+            mean_ret   = float(np.mean(list(ep_returns.values())))
+
+            # 2. PPO update (skip if buffer empty)
+            if len(self.buffer.transitions) > 0:
+                loss_dict = self.ppo_update()
+            else:
+                loss_dict = {"policy_loss": 0, "value_loss": 0,
+                             "entropy": 0, "clip_frac": 0, "approx_kl": 0}
+
+            # 3. LR decay
+            self.actor_sched.step()
+            self.critic_sched.step()
+
+            # 4. Rolling window logging
+            ret_window.append(mean_ret)
+            surv_window.append(n_alive)
+            smooth_ret = float(np.mean(ret_window))
+
+            ep_data = {
+                "episode":       ep,
+                "mean_return":   mean_ret,
+                "smooth_return": smooth_ret,
+                "n_survivors":   n_alive,
+                "policy_loss":   loss_dict.get("policy_loss", 0),
+                "value_loss":    loss_dict.get("value_loss", 0),
+                "entropy":       loss_dict.get("entropy", 0),
+                "clip_frac":     loss_dict.get("clip_frac", 0),
+                "approx_kl":     loss_dict.get("approx_kl", 0),
+                "lr_actor":      self.actor_opt.param_groups[0]["lr"],
+                "entropy_coeff": self._entropy_coeff(),
+                "team_weight":   self._team_weight(),
+                "ep_time_s":     time.time() - t0_ep,
+            }
+            ep_data.update({f"ret_{aid}": ep_returns.get(aid, 0)
+                            for aid in AGENT_IDS})
+            log_rows.append(ep_data)
+
+            # Print progress
+            if ep % 10 == 0 or ep == n_eps - 1:
+                print(
+                    f"  {ep:>5} {mean_ret:>9.2f} {smooth_ret:>9.2f} "
+                    f"{n_alive:>5d} "
+                    f"{loss_dict.get('policy_loss',0):>8.4f} "
+                    f"{loss_dict.get('value_loss',0):>8.4f} "
+                    f"{loss_dict.get('entropy',0):>7.4f} "
+                    f"{loss_dict.get('clip_frac',0)*100:>6.1f}% "
+                    f"{loss_dict.get('approx_kl',0):>7.4f} "
+                    f"{self.actor_opt.param_groups[0]['lr']:>8.2e} "
+                    f"{time.time()-t0_ep:>5.1f}s"
+                )
+
+            # 5. Evaluation
+            if (ep + 1) % self.cfg.eval_every == 0:
+                eval_metrics = self.evaluate(n_eval=3)
+                self.eval_returns.append(eval_metrics["eval_return"])
+                ep_data.update(eval_metrics)
+                new_best = eval_metrics["eval_return"] > self._best_eval_return
+                if new_best:
+                    self._best_eval_return = eval_metrics["eval_return"]
+                    self.save_checkpoint("best")
+                print(f"\n  [EVAL ep={ep+1}] "
+                      f"return={eval_metrics['eval_return']:.2f}  "
+                      f"survivors={eval_metrics['eval_survivors']:.1f}  "
+                      f"alliances={eval_metrics['eval_alliances']:.2f}  "
+                      f"trades={eval_metrics['eval_trades']:.1f}  "
+                      f"conflict={eval_metrics['eval_conflict']:.3f}"
+                      + ("  ← NEW BEST" if new_best else "") + "\n")
+
+            # 6. Periodic checkpoint
+            if (ep + 1) % self.cfg.save_every == 0:
+                self.save_checkpoint()
+
+        # Final checkpoint
+        self.save_checkpoint("final")
+
+        total_time = time.time() - t0_total
+        print(f"\n{'='*70}")
+        print(f"  Training complete — {n_eps} episodes in "
+              f"{total_time/60:.1f} min")
+        print(f"  Best eval return: {self._best_eval_return:.2f}")
+        print(f"{'='*70}")
+
+        return pd.DataFrame(log_rows)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 5 — TRAINING VISUALISATION
+# ══════════════════════════════════════════════════════════════════════════════
+
+def plot_training_curves(log_df: pd.DataFrame, save_path: str = "training_curves.png"):
+    """
+    Plot 8 training diagnostic panels from the training log DataFrame.
+    Call after trainer.train() returns log_df.
     """
     import matplotlib.pyplot as plt
-    import matplotlib.patches as mpatches
     from matplotlib.colors import LinearSegmentedColormap
     import seaborn as sns
 
-    print("\n" + "=" * 65)
-    print("WorldSim India — Visualisation Run")
-    print("=" * 65)
-
-    # ── Run ────────────────────────────────────────────────────────────────
-    sim = WorldSimIndiaEnv(csv_path=csv_path, max_cycles=n_cycles,
-                           noise_level=0.30)
-    _, _ = sim.reset(seed=random_seed)
-
-    history: list         = []
-    conflict_history: list= []
-
-    for cycle in range(n_cycles):
-        snap = sim.get_state_df()
-        snap["cycle"] = cycle
-        history.append(snap)
-        conflict_history.append(sim._conflict_matrix.copy())
-
-        if not sim.agents:
-            print(f"All agents collapsed at cycle {cycle}.")
-            break
-
-        for agent in list(sim.agents):
-            if sim.terminations.get(agent, False) or sim.truncations.get(agent, False):
-                continue
-            act_type   = np.random.randint(0, N_ACTIONS)
-            target_idx = np.random.randint(0, sim.n_agents)
-            try:
-                sim.step(np.array([act_type, target_idx]))
-            except Exception:
-                pass
-
-    df_hist = pd.concat(history, ignore_index=True)
-    print(f"\nSimulation complete — {len(history)} cycles, "
-          f"{len(sim.agents)} agents alive.")
-
-    # ── Colour palette ─────────────────────────────────────────────────────
-    COLORS = {
-        "RJ": "#e74c3c", "MH": "#3498db", "UP": "#f39c12",
-        "KL": "#2ecc71", "GJ": "#9b59b6", "WB": "#1abc9c",
-        "PB": "#e67e22", "BR": "#e91e63", "KA": "#34495e", "TN": "#16a085",
-    }
-    RESOURCE_CMAP = LinearSegmentedColormap.from_list(
-        "res", ["#c0392b", "#e67e22", "#2ecc71"])
-    CLIMATE_CMAP  = LinearSegmentedColormap.from_list(
-        "clim", ["#2ecc71", "#e67e22", "#2980b9", "#e74c3c", "#8e44ad"])
-
-    fig = plt.figure(figsize=(24, 30))
+    fig, axes = plt.subplots(3, 3, figsize=(20, 16))
     fig.patch.set_facecolor("#0a0a0a")
-    plt.suptitle("WorldSim India — Resource Conflict Simulation",
-                 fontsize=18, color="white", fontweight="bold", y=0.99)
+    fig.suptitle("WorldSim India — MAPPO Training Diagnostics",
+                 color="white", fontsize=16, fontweight="bold")
+    axes = axes.flatten()
 
-    def dark_ax(ax, title=""):
+    COLORS = {
+        "RJ":"#e74c3c","MH":"#3498db","UP":"#f39c12","KL":"#2ecc71",
+        "GJ":"#9b59b6","WB":"#1abc9c","PB":"#e67e22","BR":"#e91e63",
+        "KA":"#34495e","TN":"#16a085",
+    }
+
+    def dark(ax, title=""):
         ax.set_facecolor("#111111")
         ax.spines[:].set_color("#333333")
         ax.tick_params(colors="white")
+        ax.xaxis.label.set_color("white")
+        ax.yaxis.label.set_color("white")
         if title:
-            ax.set_title(title, color="white", fontsize=10, pad=8)
+            ax.set_title(title, color="white", fontsize=10)
         ax.grid(True, alpha=0.12, color="white")
 
-    # ── 1: Water time series ───────────────────────────────────────────────
-    ax1 = fig.add_subplot(4, 3, (1, 2))
-    dark_ax(ax1, "Water & Food Stock Over Time (solid=water, dashed=food)")
+    eps = log_df["episode"].values
+
+    # 1: Smoothed return
+    ax = axes[0]; dark(ax, "Episode Return (smoothed 20-ep window)")
+    ax.plot(eps, log_df["mean_return"],   color="#555555", lw=0.8, alpha=0.5)
+    ax.plot(eps, log_df["smooth_return"], color="#2ecc71", lw=2.0, label="Smooth return")
+    ax.axhline(0, color="#ff6b6b", lw=0.8, ls=":")
+    ax.set_xlabel("Episode"); ax.set_ylabel("Return")
+    ax.legend(facecolor="#111111", labelcolor="white", fontsize=8)
+
+    # 2: Per-agent returns
+    ax = axes[1]; dark(ax, "Per-Agent Episode Return")
     for aid in AGENT_IDS:
-        sub = df_hist[df_hist["agent_id"] == aid]
-        if "water" not in sub.columns or len(sub) < 2:
-            continue
-        c = COLORS[aid]
-        ax1.plot(sub["cycle"], sub["water"], color=c, lw=1.8,
-                 label=f"{STATE_AGENTS[aid][:12]}", alpha=0.9)
-        ax1.plot(sub["cycle"], sub["food"],  color=c, lw=1.0,
-                 ls="--", alpha=0.55)
-    ax1.axhline(0.20, color="#ff6b6b", lw=1.0, ls=":", alpha=0.8,
-                label="Water cascade (20%)")
-    ax1.axhline(0.05, color="#ff0000", lw=1.5, ls="-", alpha=0.9,
-                label="Collapse (5%)")
-    ax1.set_xlabel("Cycle", color="white")
-    ax1.set_ylabel("Stock (0–1)", color="white")
-    ax1.legend(bbox_to_anchor=(1.01, 1), loc="upper left",
-               fontsize=7, facecolor="#111111", labelcolor="white", ncol=1)
+        col = f"ret_{aid}"
+        if col in log_df.columns:
+            smoothed = pd.Series(log_df[col]).rolling(20, min_periods=1).mean()
+            ax.plot(eps, smoothed, color=COLORS[aid], lw=1.2,
+                    label=STATE_AGENTS[aid][:10], alpha=0.85)
+    ax.set_xlabel("Episode"); ax.set_ylabel("Return")
+    ax.legend(fontsize=6, facecolor="#111111", labelcolor="white",
+              bbox_to_anchor=(1.01,1), loc="upper left", ncol=1)
 
-    # ── 2: Energy time series ──────────────────────────────────────────────
-    ax2 = fig.add_subplot(4, 3, 3)
-    dark_ax(ax2, "Energy Stock Over Time")
-    for aid in AGENT_IDS:
-        sub = df_hist[df_hist["agent_id"] == aid]
-        if "energy" not in sub.columns or len(sub) < 2:
-            continue
-        ax2.plot(sub["cycle"], sub["energy"], color=COLORS[aid],
-                 lw=1.5, label=STATE_AGENTS[aid][:10])
-    ax2.axhline(0.15, color="#ff9f43", lw=1.0, ls=":",
-                label="Energy cascade (15%)")
-    ax2.set_xlabel("Cycle", color="white")
-    ax2.set_ylabel("Energy (0–1)", color="white")
-    ax2.legend(fontsize=7, facecolor="#111111", labelcolor="white")
+    # 3: Survivors
+    ax = axes[2]; dark(ax, "Agents Alive at Episode End")
+    ax.fill_between(eps, log_df["n_survivors"], alpha=0.3, color="#3498db")
+    ax.plot(eps, log_df["n_survivors"], color="#3498db", lw=1.5)
+    ax.plot(eps,
+            pd.Series(log_df["n_survivors"]).rolling(20,min_periods=1).mean(),
+            color="#f39c12", lw=2.0, label="Smoothed")
+    ax.set_ylim(0, 11)
+    ax.set_xlabel("Episode"); ax.set_ylabel("# Agents Alive")
+    ax.legend(facecolor="#111111", labelcolor="white", fontsize=8)
 
-    # ── 3: Conflict heatmap (final) ────────────────────────────────────────
-    ax3 = fig.add_subplot(4, 3, 4)
-    dark_ax(ax3, "Conflict Probability Matrix (Final Cycle)")
-    if conflict_history:
-        final_cm = conflict_history[-1]
-        mask = np.eye(sim.n_agents, dtype=bool)
-        sns.heatmap(
-            final_cm, ax=ax3,
-            xticklabels=AGENT_IDS, yticklabels=AGENT_IDS,
-            cmap="RdYlGn_r", vmin=0, vmax=1,
-            linewidths=0.4, linecolor="#222222",
-            mask=mask, annot=True, fmt=".2f", annot_kws={"size": 7},
-            cbar_kws={"shrink": 0.8},
-        )
-        ax3.tick_params(colors="white", labelsize=8)
+    # 4: Policy loss
+    ax = axes[3]; dark(ax, "Policy Loss")
+    ax.plot(eps, log_df["policy_loss"], color="#e74c3c", lw=1.0, alpha=0.7)
+    ax.plot(eps, pd.Series(log_df["policy_loss"]).rolling(20,min_periods=1).mean(),
+            color="#ff9f43", lw=2.0)
+    ax.set_xlabel("Episode"); ax.set_ylabel("Loss")
 
-    # ── 4: Mean conflict over time ─────────────────────────────────────────
-    ax4 = fig.add_subplot(4, 3, 5)
-    dark_ax(ax4, "Mean Conflict Probability Over Time")
-    for i, aid in enumerate(AGENT_IDS):
-        vals = [m[i].mean() for m in conflict_history]
-        ax4.plot(range(len(vals)), vals, color=COLORS[aid],
-                 lw=1.5, label=STATE_AGENTS[aid][:10])
-    ax4.axhline(0.60, color="#ff6b6b", lw=1.0, ls=":", alpha=0.7)
-    ax4.set_xlabel("Cycle", color="white")
-    ax4.set_ylabel("Mean Conflict Prob", color="white")
-    ax4.legend(fontsize=7, facecolor="#111111", labelcolor="white")
+    # 5: Value loss
+    ax = axes[4]; dark(ax, "Value (Critic) Loss")
+    ax.plot(eps, log_df["value_loss"], color="#9b59b6", lw=1.0, alpha=0.7)
+    ax.plot(eps, pd.Series(log_df["value_loss"]).rolling(20,min_periods=1).mean(),
+            color="#d980fa", lw=2.0)
+    ax.set_xlabel("Episode"); ax.set_ylabel("MSE Loss")
 
-    # ── 5: Social stability ────────────────────────────────────────────────
-    ax5 = fig.add_subplot(4, 3, 6)
-    dark_ax(ax5, "Social Stability Over Time")
-    for aid in AGENT_IDS:
-        sub = df_hist[df_hist["agent_id"] == aid]
-        if "social_stability" not in sub.columns or len(sub) < 2:
-            continue
-        ax5.plot(sub["cycle"], sub["social_stability"],
-                 color=COLORS[aid], lw=1.5, label=STATE_AGENTS[aid][:10])
-    ax5.set_xlabel("Cycle", color="white")
-    ax5.set_ylabel("Social Stability", color="white")
-    ax5.legend(fontsize=7, facecolor="#111111", labelcolor="white")
+    # 6: Entropy & clip fraction
+    ax = axes[5]; dark(ax, "Entropy & Clip Fraction")
+    ax2 = ax.twinx()
+    ax.plot(eps,  log_df["entropy"],   color="#1abc9c", lw=1.5, label="Entropy")
+    ax2.plot(eps, log_df["clip_frac"] * 100, color="#e67e22", lw=1.0,
+             ls="--", alpha=0.7, label="Clip %")
+    ax.set_xlabel("Episode")
+    ax.set_ylabel("Entropy",    color="#1abc9c")
+    ax2.set_ylabel("Clip %",   color="#e67e22")
+    ax.tick_params(axis="y", colors="#1abc9c")
+    ax2.tick_params(axis="y", colors="#e67e22")
+    ax2.spines[:].set_color("#333333")
+    ax2.set_facecolor("#111111")
 
-    # ── 6: Trade network (final) ───────────────────────────────────────────
-    ax6 = fig.add_subplot(4, 3, 7)
-    ax6.set_facecolor("#111111")
-    ax6.set_title("Trade Network (Final)", color="white", fontsize=10, pad=8)
-    G = sim.get_trade_graph()
-    if G.number_of_nodes() > 0:
-        pos = nx.spring_layout(G, seed=42, k=2.0)
-        nsizes = [
-            400 + sim._state.get(n, {}).get("economic_power", 0.3) * 700
-            for n in G.nodes()
-        ]
-        nx.draw_networkx_nodes(G, pos, ax=ax6,
-                               node_size=nsizes,
-                               node_color=[COLORS.get(n, "#888") for n in G.nodes()],
-                               alpha=0.9)
-        nx.draw_networkx_labels(G, pos, ax=ax6,
-                                font_size=7, font_color="white", font_weight="bold")
-        edges    = list(G.edges(data=True))
-        ew       = [e[2].get("weight", 0.1) * 4 for e in edges]
-        ecol     = ["#2ecc71" if e[2].get("active", True) else "#c0392b" for e in edges]
-        if edges:
-            nx.draw_networkx_edges(G, pos, ax=ax6, width=ew, edge_color=ecol,
-                                   alpha=0.6, arrows=True, arrowsize=10,
-                                   connectionstyle="arc3,rad=0.1")
-    ax6.axis("off")
+    # 7: LR decay
+    ax = axes[6]; dark(ax, "Learning Rate Decay")
+    ax.semilogy(eps, log_df["lr_actor"], color="#2980b9", lw=1.5)
+    ax.set_xlabel("Episode"); ax.set_ylabel("Actor LR (log)")
 
-    # ── 7: Reputation ─────────────────────────────────────────────────────
-    ax7 = fig.add_subplot(4, 3, 8)
-    dark_ax(ax7, "Agent Reputation Over Time")
-    for aid in AGENT_IDS:
-        sub = df_hist[df_hist["agent_id"] == aid]
-        if "reputation" not in sub.columns or len(sub) < 2:
-            continue
-        ax7.plot(sub["cycle"], sub["reputation"],
-                 color=COLORS[aid], lw=1.5, label=STATE_AGENTS[aid][:10])
-    ax7.axhline(0.40, color="#ff9f43", lw=1.0, ls=":",
-                label="Alliance threshold (0.4)")
-    ax7.set_xlabel("Cycle", color="white")
-    ax7.set_ylabel("Reputation", color="white")
-    ax7.legend(fontsize=7, facecolor="#111111", labelcolor="white")
+    # 8: Curriculum / entropy coefficient
+    ax = axes[7]; dark(ax, "Curriculum & Entropy Coefficient")
+    ax.plot(eps, log_df["team_weight"],    color="#f39c12", lw=2.0,
+            label="Team reward weight")
+    ax.plot(eps, log_df["entropy_coeff"],  color="#2ecc71", lw=2.0,
+            label="Entropy coeff")
+    ax.set_xlabel("Episode"); ax.set_ylabel("Coefficient")
+    ax.legend(facecolor="#111111", labelcolor="white", fontsize=8)
 
-    # ── 8: Initial resource radar ──────────────────────────────────────────
-    ax8 = fig.add_subplot(4, 3, 9, polar=True)
-    ax8.set_facecolor("#111111")
-    ax8.set_title("Initial Resource Profile (first 5 agents)",
-                  color="white", fontsize=10, pad=20)
-    cats = ["Water", "Food", "Energy", "EcoPow", "Adaptive"]
-    N_c  = len(cats)
-    angs = [n / N_c * 2 * np.pi for n in range(N_c)] + [0]
-    ax8.set_xticks(angs[:-1])
-    ax8.set_xticklabels(cats, color="white", size=8)
-    ax8.tick_params(colors="white")
-    ax8.spines["polar"].set_color("#333333")
-    for aid in AGENT_IDS[:5]:
-        r = sim.data_loader.region_init[aid]
-        vals = [r["water_stock"], r["food_stock"], r["energy_stock"],
-                r["economic_power"], r["adaptive_capacity"]] + [r["water_stock"]]
-        ax8.plot(angs, vals, lw=1.5, color=COLORS[aid],
-                 label=STATE_AGENTS[aid][:10])
-        ax8.fill(angs, vals, alpha=0.07, color=COLORS[aid])
-    ax8.legend(loc="upper right", bbox_to_anchor=(1.35, 1.15),
-               fontsize=7, facecolor="#111111", labelcolor="white")
+    # 9: Eval returns (sparse)
+    ax = axes[8]; dark(ax, "Deterministic Eval Returns")
+    eval_rows = log_df.dropna(subset=["eval_return"]) if "eval_return" in log_df.columns else pd.DataFrame()
+    if len(eval_rows) > 0:
+        ax.plot(eval_rows["episode"], eval_rows["eval_return"],
+                "o-", color="#e74c3c", lw=2.0, ms=5, label="Eval return")
+        ax.plot(eval_rows["episode"], eval_rows["eval_survivors"],
+                "s--", color="#3498db", lw=1.5, ms=4, label="Eval survivors")
+        ax.legend(facecolor="#111111", labelcolor="white", fontsize=8)
+    ax.set_xlabel("Episode")
 
-    # ── 9: Population dynamics ─────────────────────────────────────────────
-    ax9 = fig.add_subplot(4, 3, 10)
-    dark_ax(ax9, "Population Dynamics")
-    for aid in AGENT_IDS:
-        sub = df_hist[df_hist["agent_id"] == aid]
-        if "population" not in sub.columns or len(sub) < 2:
-            continue
-        ax9.plot(sub["cycle"], sub["population"],
-                 color=COLORS[aid], lw=1.5, label=STATE_AGENTS[aid][:10])
-    ax9.set_xlabel("Cycle", color="white")
-    ax9.set_ylabel("Population (normalised)", color="white")
-    ax9.legend(fontsize=7, facecolor="#111111", labelcolor="white")
-
-    # ── 10: Climate state heatmap ──────────────────────────────────────────
-    ax10 = fig.add_subplot(4, 3, 11)
-    dark_ax(ax10, "Climate State History (per agent per cycle)")
-    max_c = min(n_cycles, len(history))
-    clim_mat = np.zeros((len(AGENT_IDS), max_c))
-    cs_map = {"Normal": 0, "Drought": 1, "Flood": 2, "Heatwave": 3, "Storm": 4}
-    for ci, snap in enumerate(history[:max_c]):
-        for ai, aid in enumerate(AGENT_IDS):
-            row = snap[snap["agent_id"] == aid]
-            if len(row) > 0 and "climate" in row.columns:
-                clim_mat[ai, ci] = cs_map.get(row["climate"].iloc[0], 0)
-    im = ax10.imshow(clim_mat, aspect="auto", cmap=CLIMATE_CMAP,
-                     vmin=0, vmax=4, interpolation="nearest")
-    ax10.set_yticks(range(len(AGENT_IDS)))
-    ax10.set_yticklabels(AGENT_IDS, color="white", fontsize=8)
-    ax10.set_xlabel("Cycle", color="white")
-    cbar = plt.colorbar(im, ax=ax10, shrink=0.8)
-    cbar.set_ticks([0, 1, 2, 3, 4])
-    cbar.set_ticklabels(["Normal", "Drought", "Flood", "Heat", "Storm"])
-    cbar.ax.tick_params(colors="white", labelsize=7)
-
-    # ── 11: Economic power ─────────────────────────────────────────────────
-    ax11 = fig.add_subplot(4, 3, 12)
-    dark_ax(ax11, "Economic Power Over Time")
-    for aid in AGENT_IDS:
-        sub = df_hist[df_hist["agent_id"] == aid]
-        if "economic_power" not in sub.columns or len(sub) < 2:
-            continue
-        ax11.plot(sub["cycle"], sub["economic_power"],
-                  color=COLORS[aid], lw=1.5, label=STATE_AGENTS[aid][:10])
-    ax11.set_xlabel("Cycle", color="white")
-    ax11.set_ylabel("Economic Power", color="white")
-    ax11.legend(fontsize=7, facecolor="#111111", labelcolor="white")
-
-    plt.tight_layout(rect=[0, 0, 1, 0.985], pad=2.0)
-    out_path = "worldsim_india_visualisation.png"
-    plt.savefig(out_path, dpi=150, bbox_inches="tight",
+    plt.tight_layout(pad=2.0)
+    plt.savefig(save_path, dpi=150, bbox_inches="tight",
                 facecolor="#0a0a0a", edgecolor="none")
-    print(f"\n✅ Saved → {out_path}")
+    print(f"[MAPPO] Training curves saved → {save_path}")
     plt.show()
-    return sim, df_hist
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SECTION 6 — ENTRY POINT
+# SECTION 6 — STRATEGY ANALYSIS
+# WorldSim Blueprint Feature 6: "Strategy Heatmap — the moment an agent
+# figured out its only viable path"
+# ══════════════════════════════════════════════════════════════════════════════
+
+def analyse_emergent_strategies(
+    trainer: MAPPOTrainer,
+    n_eval_episodes: int = 20,
+    save_path: str = "strategy_analysis.png",
+):
+    """
+    Run n_eval_episodes of deterministic policy and extract:
+      1. Action frequency heatmap per agent (strategy heatmap)
+      2. Alliance formation patterns
+      3. Defection history correlation with resource stress
+      4. Survival rate by initial resource profile
+    """
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+
+    print(f"\n[Analysis] Running {n_eval_episodes} eval episodes...")
+    trainer.actor.eval()
+
+    # Aggregate action counts per (agent, action_type)
+    action_counts  = np.zeros((len(AGENT_IDS), N_ACTIONS), dtype=float)
+    alliance_counts= np.zeros((len(AGENT_IDS), len(AGENT_IDS)), dtype=float)
+    survival_record= defaultdict(list)
+    defection_by_aid= defaultdict(int)
+    trade_by_pair  = defaultdict(int)
+
+    for trial in range(n_eval_episodes):
+        obs_dict, _ = trainer.env.reset(seed=1000 + trial)
+        current_obs = dict(obs_dict)
+
+        for step in range(trainer.cfg.max_cycles):
+            if not trainer.env.agents:
+                break
+            agent = trainer.env.agent_selection
+            if trainer.env.terminations.get(agent, False) or \
+               trainer.env.truncations.get(agent, False):
+                try: trainer.env.step(np.array([16, 0]))
+                except: pass
+                continue
+
+            aid_idx = AGENT_IDS.index(agent)
+            obs_np  = current_obs.get(agent, np.zeros(trainer.cfg.obs_dim, dtype=np.float32))
+
+            with torch.no_grad():
+                obs_t = trainer._obs_to_tensor(obs_np)
+                aid_t = torch.LongTensor([aid_idx]).to(DEVICE)
+                act, tgt, _, _ = trainer.actor.get_action(obs_t, aid_t, deterministic=True)
+
+            action_type = int(act.item())
+            target_idx  = int(tgt.item())
+            action_counts[aid_idx, action_type] += 1
+
+            trainer.env.step(np.array([action_type, target_idx]))
+            current_obs[agent] = trainer.env._observe(agent)
+
+        # Record end-of-episode state
+        for aid in AGENT_IDS:
+            survived = aid in trainer.env.agents
+            survival_record[aid].append(int(survived))
+            n_allies = len(trainer.env._alliances.get(aid, set()))
+            for ally in trainer.env._alliances.get(aid, set()):
+                ai = AGENT_IDS.index(aid)
+                aj = AGENT_IDS.index(ally) if ally in AGENT_IDS else -1
+                if aj >= 0:
+                    alliance_counts[ai, aj] += 1
+
+        for (a, b) in trainer.env._trade_agreements:
+            trade_by_pair[(a, b)] += 1
+        for aid in AGENT_IDS:
+            defection_by_aid[aid] += trainer.env._defection_count.get(aid, 0)
+
+    trainer.actor.train()
+
+    # ── Normalise ────────────────────────────────────────────────────────────
+    row_sums = action_counts.sum(axis=1, keepdims=True)
+    action_freq = action_counts / np.maximum(row_sums, 1)
+    alliance_freq = alliance_counts / max(n_eval_episodes, 1)
+    survival_rate = {aid: float(np.mean(v)) for aid, v in survival_record.items()}
+    defection_rate = {aid: defection_by_aid[aid] / max(n_eval_episodes, 1)
+                      for aid in AGENT_IDS}
+
+    # ── Plots ─────────────────────────────────────────────────────────────────
+    fig, axes = plt.subplots(2, 2, figsize=(18, 14))
+    fig.patch.set_facecolor("#0a0a0a")
+    fig.suptitle("WorldSim India — Emergent Strategy Analysis",
+                 color="white", fontsize=16, fontweight="bold")
+
+    def dark(ax, title=""):
+        ax.set_facecolor("#111111")
+        ax.spines[:].set_color("#333333")
+        ax.tick_params(colors="white")
+        if title: ax.set_title(title, color="white", fontsize=11)
+
+    action_labels = [ACTION_TYPES[i] for i in range(N_ACTIONS)]
+    state_labels  = [STATE_AGENTS[a][:10] for a in AGENT_IDS]
+
+    # 1: Strategy heatmap
+    ax = axes[0, 0]; dark(ax, "Strategy Heatmap — Action Frequency per Agent")
+    sns.heatmap(
+        action_freq, ax=ax,
+        xticklabels=action_labels, yticklabels=state_labels,
+        cmap="YlOrRd", vmin=0, vmax=action_freq.max(),
+        linewidths=0.3, linecolor="#222222",
+        annot=True, fmt=".2f", annot_kws={"size": 7},
+        cbar_kws={"shrink": 0.8},
+    )
+    ax.tick_params(axis="x", rotation=45, labelsize=7, colors="white")
+    ax.tick_params(axis="y", labelsize=8, colors="white")
+
+    # 2: Alliance network heatmap
+    ax = axes[0, 1]; dark(ax, "Alliance Formation Frequency")
+    mask = np.eye(len(AGENT_IDS), dtype=bool)
+    sns.heatmap(
+        alliance_freq, ax=ax,
+        xticklabels=AGENT_IDS, yticklabels=AGENT_IDS,
+        cmap="Blues", vmin=0,
+        linewidths=0.5, linecolor="#333333",
+        mask=mask, annot=True, fmt=".1f", annot_kws={"size": 8},
+        cbar_kws={"shrink": 0.8},
+    )
+    ax.tick_params(colors="white", labelsize=8)
+
+    # 3: Survival rate + defection
+    ax = axes[1, 0]; dark(ax, "Survival Rate & Defection Rate by State")
+    x = np.arange(len(AGENT_IDS))
+    surv_vals = [survival_rate[a] for a in AGENT_IDS]
+    def_vals  = [defection_rate[a] for a in AGENT_IDS]
+    bars = ax.bar(x - 0.2, surv_vals, 0.35, color="#2ecc71", alpha=0.85,
+                  label="Survival rate")
+    ax2  = ax.twinx()
+    ax2.bar(x + 0.2, def_vals, 0.35, color="#e74c3c", alpha=0.70,
+            label="Defection rate")
+    ax.set_xticks(x); ax.set_xticklabels(AGENT_IDS, color="white", fontsize=9)
+    ax.set_ylabel("Survival rate", color="#2ecc71")
+    ax2.set_ylabel("Defections / episode", color="#e74c3c")
+    ax.tick_params(axis="y", colors="#2ecc71")
+    ax2.tick_params(axis="y", colors="#e74c3c")
+    ax2.spines[:].set_color("#333333")
+    ax2.set_facecolor("#111111")
+    ax.set_ylim(0, 1.15)
+    lines1, labs1 = ax.get_legend_handles_labels()
+    lines2, labs2 = ax2.get_legend_handles_labels()
+    ax.legend(lines1 + lines2, labs1 + labs2,
+              facecolor="#111111", labelcolor="white", fontsize=8,
+              loc="upper right")
+
+    # 4: Initial resource profile vs survival
+    ax = axes[1, 1]; dark(ax, "Initial Resource Profile vs Survival Rate")
+    init   = trainer.env.data_loader.region_init
+    labels = {"water_stock": "Water", "food_stock": "Food",
+              "energy_stock": "Energy", "economic_power": "Economy"}
+    colors_s = ["#3498db","#2ecc71","#f39c12","#e74c3c"]
+    xs = np.arange(len(AGENT_IDS))
+    for i, (key, lbl) in enumerate(labels.items()):
+        vals = [init[a][key] for a in AGENT_IDS]
+        ax.plot(xs, vals, "o-", color=colors_s[i], lw=1.5,
+                label=lbl, alpha=0.85)
+    ax.plot(xs, surv_vals, "s--", color="white", lw=2.0,
+            ms=6, label="Survival rate")
+    ax.set_xticks(xs)
+    ax.set_xticklabels([STATE_AGENTS[a][:6] for a in AGENT_IDS],
+                       color="white", fontsize=8)
+    ax.set_ylabel("Score (0–1)", color="white")
+    ax.legend(facecolor="#111111", labelcolor="white", fontsize=8)
+
+    plt.tight_layout(pad=2.0)
+    plt.savefig(save_path, dpi=150, bbox_inches="tight",
+                facecolor="#0a0a0a", edgecolor="none")
+    print(f"[Analysis] Strategy analysis saved → {save_path}")
+    plt.show()
+
+    # Print summary table
+    print(f"\n{'─'*60}")
+    print(f"  {'State':<22} {'Survival':>9} {'Defects/ep':>11} "
+          f"{'Top Action':<20}")
+    print(f"  {'─'*22} {'─'*9} {'─'*11} {'─'*20}")
+    for aid in AGENT_IDS:
+        top_act_idx = int(action_freq[AGENT_IDS.index(aid)].argmax())
+        top_act     = ACTION_TYPES.get(top_act_idx, "?")
+        print(f"  {STATE_AGENTS[aid]:<22} {survival_rate[aid]:>9.1%} "
+              f"{defection_rate[aid]:>11.2f} {top_act:<20}")
+    print(f"{'─'*60}\n")
+
+    return {
+        "action_freq":    action_freq,
+        "alliance_freq":  alliance_freq,
+        "survival_rate":  survival_rate,
+        "defection_rate": defection_rate,
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 7 — ENTRY POINT
 # ══════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    # ── Update this path for your Kaggle input directory ──────────────────
-    CSV_PATH = "worldsim_merged.csv"  
-    N_CYCLES = 100
 
-    print("\n" + "=" * 65)
-    print("WorldSim India — PettingZoo AEC Environment")
-    print("=" * 65)
+    CSV_PATH = "worldsim_merged.csv"   # update for your Kaggle path
 
-    # 1. Validate PettingZoo API
-    print("\n[1] API validation ...")
-    raw_env = WorldSimIndiaEnv(csv_path=CSV_PATH, max_cycles=N_CYCLES)
-    obs, infos = raw_env.reset(seed=42)
+    # ── Quick smoke test (5 episodes, short cycles) ───────────────────────────
+    print("\n[0] Smoke test (5 episodes) ...")
+    cfg_test = MAPPOConfig(
+        csv_path    = CSV_PATH,
+        n_episodes  = 5,
+        max_cycles  = 30,
+        n_epochs    = 2,
+        eval_every  = 5,
+        save_every  = 99,
+    )
+    trainer = MAPPOTrainer(CSV_PATH, config=cfg_test)
 
-    print(f"  Observation space : {raw_env.observation_spaces['RJ']}")
-    print(f"  Action space      : {raw_env.action_spaces['RJ']}")
-    print(f"  Obs shape         : {obs['RJ'].shape}")
-    print(f"  Active agents     : {raw_env.agents}")
-    assert obs["RJ"].shape == (WorldSimIndiaEnv.OBS_DIM,), "Observation dim mismatch!"
-    assert not np.any(np.isnan(obs["RJ"])), "NaN in initial observation!"
-    print("  ✓ API checks passed")
+    # Validate networks
+    dummy_obs    = torch.zeros(1, cfg_test.obs_dim,             device=DEVICE)
+    dummy_glob   = torch.zeros(1, cfg_test.obs_dim * cfg_test.n_agents, device=DEVICE)
+    dummy_aid    = torch.zeros(1, dtype=torch.long,             device=DEVICE)
+    act_l, tgt_l = trainer.actor(dummy_obs, dummy_aid)
+    val          = trainer.critic(dummy_glob)
+    assert act_l.shape == (1, N_ACTIONS),  f"Actor shape: {act_l.shape}"
+    assert tgt_l.shape == (1, 10),          f"Target shape: {tgt_l.shape}"
+    assert val.shape   == (1, 1),           f"Critic shape: {val.shape}"
+    print("  ✓ Network forward pass shapes correct")
 
-    # 2. Single step test
-    print("\n[2] Single step test ...")
-    raw_env.step(np.array([6, 1])) 
-    raw_env.render()
+    log_df = trainer.train(n_episodes=5)
+    assert len(log_df) == 5, "Expected 5 log rows"
+    assert "mean_return" in log_df.columns
+    assert "policy_loss" in log_df.columns
+    print("  ✓ Training loop OK")
 
-    # 3. Full episode + visualisation
-    print("\n[3] Full episode with visualisation ...")
-    sim_env, df_history = run_visualisation(
-        csv_path=CSV_PATH, n_cycles=N_CYCLES, random_seed=42)
+    # ── Full training ─────────────────────────────────────────────────────────
+    print("\n[1] Full training run ...")
+    cfg_full = MAPPOConfig(
+        csv_path        = CSV_PATH,
+        n_episodes      = 6000,
+        max_cycles      = 150,
+        n_epochs        = 4,  # Reduced
+        minibatch_size  = 128,  # Increased
+        eval_every      = 50,
+        save_every      = 100,
+        actor_hidden    = [256, 256],
+        critic_hidden   = [512, 512],
+        lr_actor        = 5e-5,  # Reduced further
+        lr_critic       = 1e-4,  # Reduced further
+        gamma           = 0.995,  # Increased
+        gae_lambda      = 0.95,
+        clip_eps        = 0.15,  # Reduced
+        entropy_coeff   = 0.02,  # Adjusted
+        value_coeff     = 1.0,  # Increased
+        max_grad_norm   = 0.5,  # Tightened
+        lr_decay        = 0.999,  # Slower
+        entropy_start   = 0.1,  # Increased
+        entropy_end     = 0.01,  # Increased
+        curriculum_start= 0.70,
+        curriculum_end  = 0.20,
+    )
+    trainer = MAPPOTrainer(CSV_PATH, config=cfg_full)
+    log_df = trainer.train()
 
-    # 4. Summary
-    print("\n[4] Final state summary:")
-    final = df_history[df_history["cycle"] == df_history["cycle"].max()]
-    for _, row in final.iterrows():
-        aid = row.get("agent_id", "?")
-        if row.get("status") == "collapsed":
-            print(f"  {aid} ({STATE_AGENTS.get(aid, '?'):<22}) : COLLAPSED")
-        else:
-            w = row.get("water", 0)
-            f = row.get("food",  0)
-            e = row.get("energy",0)
-            r = row.get("reputation", 0)
-            print(f"  {aid} ({STATE_AGENTS.get(aid, '?'):<22}) : "
-                  f"W={w:.3f}  F={f:.3f}  E={e:.3f}  Rep={r:.2f}")
+    # ── Training curves ───────────────────────────────────────────────────────
+    print("\n[2] Generating training diagnostic plots ...")
+    plot_training_curves(log_df, save_path="worldsim_training_curves.png")
 
-    print("\n✅ WorldSim India complete.")
-    print("   Next step: replace random policy with MAPPO agents via RLlib.")
+    # ── Strategy analysis ─────────────────────────────────────────────────────
+    print("\n[3] Emergent strategy analysis ...")
+    # Load best checkpoint for analysis
+    best_ckpt = os.path.join(cfg_full.checkpoint_dir,
+                             "worldsim_india_ep0_best.pt")  # placeholder
+    ckpts = [f for f in os.listdir(cfg_full.checkpoint_dir) if "best" in f]
+    if ckpts:
+        trainer.load_checkpoint(
+            os.path.join(cfg_full.checkpoint_dir, sorted(ckpts)[-1]))
+    analysis = analyse_emergent_strategies(
+        trainer, n_eval_episodes=20,
+        save_path="worldsim_strategy_analysis.png")
+
+    # ── Save training log ─────────────────────────────────────────────────────
+    log_df.to_csv("worldsim_training_log.csv", index=False)
+    print("\n[4] Training log saved → worldsim_training_log.csv")
+
+    print("\n✅ WorldSim India MAPPO complete.")
+    print("   Outputs: worldsim_training_curves.png  |  "
+          "worldsim_strategy_analysis.png  |  worldsim_training_log.csv")

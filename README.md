@@ -1,6 +1,6 @@
 # slayers
 
-##PS1
+## PS- 1
 # 📂 Datasets
 
 This project integrates multiple global datasets to simulate adaptive regional dynamics under resource scarcity, climate variation, and international trade interactions.

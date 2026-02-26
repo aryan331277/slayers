@@ -7,7 +7,7 @@ This project integrates multiple global datasets to simulate adaptive regional d
 ## 🌧️ Global Precipitation Modeling Dataset
 
 Source: OEMC Hackathon – Global Precipitation Modeling
-🔗 https://www.kaggle.com/competitions/oemc-hackathon-global-precipitation-modeling
+🔗https://data.unodc.org/
 
 Purpose in Project
 
@@ -24,7 +24,7 @@ This dataset provides global precipitation information used to dynamically modif
 ## 🌍 Global Commodity Trade Statistics (UN Comtrade)
 
 Source: United Nations Global Commodity Trade Statistics
-🔗 https://www.kaggle.com/datasets/unitednations/global-commodity-trade-statistics
+## worldbank data
 
 Purpose in Project
 

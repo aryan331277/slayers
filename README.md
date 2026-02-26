@@ -25,6 +25,7 @@ This dataset provides global precipitation information used to dynamically modif
 
 Source: United Nations Global Commodity Trade Statistics
 ## worldbank data
+https://data.worldbank.org/
 
 Purpose in Project
 
@@ -41,7 +42,7 @@ The dataset enables creation of dynamic economic connections between simulated r
 ## 🔄 International Trade Database
 
 Source: International Trade Database (UN Comtrade Derived)
-🔗 https://www.kaggle.com/datasets/appetukhov/international-trade-database
+🔗 https://data.worldbank.org/
 
 Purpose in Project
 
@@ -73,7 +74,7 @@ Agricultural production metrics act as proxies for food resource availability.
 ## ⚡ World Development Indicators (World Bank)
 
 Source: World Bank World Development Indicators
-🔗 https://www.kaggle.com/datasets/nicolasgonzalezmunoz/world-bank-world-development-indicators
+🔗 https://data.worldbank.org/
 
 Purpose in Project
 

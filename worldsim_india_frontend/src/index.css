@@ -1,0 +1,170 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --radius: 0.625rem;
+  --background: #0a0a0f;
+  --foreground: #ffffff;
+  --card: #12121a;
+  --card-foreground: #ffffff;
+  --popover: #1a1a25;
+  --popover-foreground: #ffffff;
+  --primary: #00d4ff;
+  --primary-foreground: #000000;
+  --secondary: #1e1e2e;
+  --secondary-foreground: #ffffff;
+  --muted: #2a2a3a;
+  --muted-foreground: #a0a0b0;
+  --accent: #ff6b35;
+  --accent-foreground: #ffffff;
+  --destructive: #ff3333;
+  --border: #2a2a3a;
+  --input: #1e1e2e;
+  --ring: #00d4ff;
+  --chart-1: #00d4ff;
+  --chart-2: #ff6b35;
+  --chart-3: #f7c600;
+  --chart-4: #00ff88;
+  --chart-5: #ff3333;
+  --sidebar: #0f0f15;
+  --sidebar-foreground: #ffffff;
+  --sidebar-primary: #00d4ff;
+  --sidebar-primary-foreground: #000000;
+  --sidebar-accent: #1e1e2e;
+  --sidebar-accent-foreground: #ffffff;
+  --sidebar-border: #2a2a3a;
+  --sidebar-ring: #00d4ff;
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+  body {
+    @apply bg-background text-foreground;
+    font-family: 'Inter', system-ui, -apple-system, sans-serif;
+  }
+}
+
+/* High Contrast Color Classes */
+.status-green {
+  background: linear-gradient(135deg, #00ff88 0%, #00cc6a 100%);
+  box-shadow: 0 0 20px rgba(0, 255, 136, 0.5);
+}
+
+.status-amber {
+  background: linear-gradient(135deg, #f7c600 0%, #d4a800 100%);
+  box-shadow: 0 0 20px rgba(247, 198, 0, 0.5);
+}
+
+.status-red {
+  background: linear-gradient(135deg, #ff3333 0%, #cc0000 100%);
+  box-shadow: 0 0 20px rgba(255, 51, 51, 0.5);
+}
+
+.status-black {
+  background: linear-gradient(135deg, #1a1a1a 0%, #000000 100%);
+  box-shadow: 0 0 20px rgba(0, 0, 0, 0.8);
+  border: 2px solid #ff3333;
+}
+
+/* Pulse Animations */
+@keyframes pulse-green {
+  0%, 100% { box-shadow: 0 0 20px rgba(0, 255, 136, 0.5); }
+  50% { box-shadow: 0 0 40px rgba(0, 255, 136, 0.8); }
+}
+
+@keyframes pulse-amber {
+  0%, 100% { box-shadow: 0 0 20px rgba(247, 198, 0, 0.5); }
+  50% { box-shadow: 0 0 40px rgba(247, 198, 0, 0.8); }
+}
+
+@keyframes pulse-red {
+  0%, 100% { box-shadow: 0 0 20px rgba(255, 51, 51, 0.5); }
+  50% { box-shadow: 0 0 40px rgba(255, 51, 51, 0.9); }
+}
+
+@keyframes pulse-glow {
+  0%, 100% { opacity: 0.6; }
+  50% { opacity: 1; }
+}
+
+.pulse-glow {
+  animation: pulse-glow 2s ease-in-out infinite;
+}
+
+/* Network Line Animations */
+@keyframes flow-line {
+  0% { stroke-dashoffset: 100; }
+  100% { stroke-dashoffset: 0; }
+}
+
+.flow-line {
+  animation: flow-line 2s linear infinite;
+}
+
+/* Scrollbar Styling */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: #0a0a0f;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #2a2a3a;
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #00d4ff;
+}
+
+/* Grid Background */
+.grid-bg {
+  background-image: 
+    linear-gradient(rgba(0, 212, 255, 0.03) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(0, 212, 255, 0.03) 1px, transparent 1px);
+  background-size: 50px 50px;
+}
+
+/* Glass Effect */
+.glass {
+  background: rgba(18, 18, 26, 0.8);
+  backdrop-filter: blur(10px);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+/* Neon Text */
+.neon-text {
+  text-shadow: 0 0 10px rgba(0, 212, 255, 0.5),
+               0 0 20px rgba(0, 212, 255, 0.3),
+               0 0 30px rgba(0, 212, 255, 0.2);
+}
+
+/* Card Hover Effect */
+.card-hover {
+  transition: all 0.3s ease;
+}
+
+.card-hover:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 10px 40px rgba(0, 212, 255, 0.2);
+}
+
+/* Print Styles */
+@media print {
+  body {
+    background: white !important;
+    color: black !important;
+  }
+  .no-print {
+    display: none !important;
+  }
+  .print-only {
+    display: block !important;
+  }
+}
